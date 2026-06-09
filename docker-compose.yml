@@ -1,0 +1,67 @@
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SmartScheduler – Docker Compose
+#
+# Services:
+#   ollama            → Ollama LLM server (port 11434)
+#   smartscheduler    → Python pipeline application
+#
+# Usage:
+#   docker compose up --build          # run Use Case A (default)
+#   docker compose run --rm smartscheduler --use-case B   # Use Case B
+#   docker compose up ollama           # start only Ollama (for local dev)
+# ──────────────────────────────────────────────────────────────────────────────
+
+networks:
+  smartscheduler_net:
+    driver: bridge
+
+volumes:
+  ollama_data:          # Persists downloaded models between restarts
+
+services:
+
+  # ── Ollama LLM Server ───────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    networks:
+      - smartscheduler_net
+    ports:
+      - "11434:11434"           # Expose for local debugging (optional)
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h   # Keep model loaded in memory
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ── SmartScheduler Application ──────────────────────────────────────────────
+  smartscheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: smartscheduler
+    restart: "no"              # Run-to-completion (not a long-running service)
+    networks:
+      - smartscheduler_net
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      # Mount output directory so generated CSV/JSON appear on the host
+      - ./:/app/output:rw
+    env_file:
+      - .env
+    environment:
+      # LLM provider configuration
+      - LLM_PROVIDER=ollama
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - LLM_MODEL=${LLM_MODEL:-llama3.2}
+      - LLM_TEMPERATURE=${LLM_TEMPERATURE:-0.2}
+    command: ["--use-case", "A"]   # Default: Use Case A
