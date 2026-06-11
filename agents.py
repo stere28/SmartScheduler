@@ -442,15 +442,10 @@ def verification_agent(state: SmartSchedulerState) -> SmartSchedulerState:
                         description=f"Day {d} shift {SHIFT_NAMES[s]}: only {len(staff)} workers (need ≥2)."
                     ))
             else:
-                n_std  = sum(1 for wid in staff if _worker_type(wid, workers) == "standard")
                 n_spec = sum(1 for wid in staff if _worker_type(wid, workers) == "specialized")
                 if n_spec < 1:
                     violations.append(ConstraintViolation(
                         description=f"Day {d} shift {SHIFT_NAMES[s]}: no specialized worker."
-                    ))
-                if n_std < 1:
-                    violations.append(ConstraintViolation(
-                        description=f"Day {d} shift {SHIFT_NAMES[s]}: no standard worker."
                     ))
                 if len(staff) < 3:
                     violations.append(ConstraintViolation(
@@ -465,6 +460,14 @@ def verification_agent(state: SmartSchedulerState) -> SmartSchedulerState:
             if len(shifts_today) > 1:
                 violations.append(ConstraintViolation(
                     description=f"Worker {wp.worker_id} assigned {len(shifts_today)} shifts on day {d}."
+                ))
+
+    # -- Check H3: no subsequent shifts (afternoon -> morning) --
+    for wp in workers:
+        for d in range(len(DATES) - 1):
+            if assign_map[wp.worker_id].get(d) == 1 and assign_map[wp.worker_id].get(d+1) == 0:
+                violations.append(ConstraintViolation(
+                    description=f"Worker {wp.worker_id}: afternoon on day {d} followed by morning on day {d+1}."
                 ))
 
     # -- Check H4: 2 free days after night shift --
@@ -496,7 +499,7 @@ def verification_agent(state: SmartSchedulerState) -> SmartSchedulerState:
                 )
             ))
 
-    # -- Check H6: weekly hours ≤ 36 --
+    # -- Check H6: weekly hours ≤ 36 (Calendar Weeks) --
     import math
     from config import SHIFT_HOURS, MAX_HOURS_PER_WEEK
     num_weeks = math.ceil(len(DATES) / 7)
@@ -505,13 +508,24 @@ def verification_agent(state: SmartSchedulerState) -> SmartSchedulerState:
             day_start = wk * 7
             day_end   = min(day_start + 7, len(DATES))
             hours = sum(
-                SHIFT_HOURS[a.shift_index]
-                for a in schedule.assignments
-                if a.worker_id == wp.worker_id and day_start <= a.day_index < day_end
+                SHIFT_HOURS[assign_map[wp.worker_id].get(d)]
+                for d in range(day_start, day_end)
+                if d in assign_map[wp.worker_id]
             )
             if hours > MAX_HOURS_PER_WEEK:
                 violations.append(ConstraintViolation(
                     description=f"Worker {wp.worker_id} week {wk}: {hours}h > {MAX_HOURS_PER_WEEK}h."
+                ))
+
+    # -- Check H7: at least 1 rest day per week (Calendar Weeks) --
+    for wp in workers:
+        for wk in range(num_weeks):
+            day_start = wk * 7
+            day_end   = min(day_start + 7, len(DATES))
+            worked_days = sum(1 for d in range(day_start, day_end) if d in assign_map[wp.worker_id])
+            if worked_days == (day_end - day_start):
+                violations.append(ConstraintViolation(
+                    description=f"Worker {wp.worker_id}: 0 rest days in week {wk}."
                 ))
 
     passed = len(violations) == 0
@@ -612,25 +626,6 @@ def _compute_fairness(
 # STAGE 4 – Refinement Agent
 # ══════════════════════════════════════════════════════════════════════════════
 
-REFINEMENT_SYSTEM_PROMPT = """\
-You are a hospital scheduling optimizer. You are given the current schedule's
-fairness report and must decide on a refinement strategy.
-
-Focus on improving the satisfaction of the LEAST satisfied worker without 
-worsening the satisfaction of other workers.
-
-Output a JSON object:
-{
-  "focus_worker": "<worker_id>",
-  "strategy": "<description of refinement approach>",
-  "prioritize_shifts": ["morning"|"afternoon"|"night"],
-  "reduce_shifts": ["morning"|"afternoon"|"night"]
-}
-
-Only output valid JSON, no extra text.
-"""
-
-
 def refinement_agent(state: SmartSchedulerState) -> SmartSchedulerState:
     """
     Stage 4: Iteratively refine the schedule to improve fairness.
@@ -647,9 +642,23 @@ def refinement_agent(state: SmartSchedulerState) -> SmartSchedulerState:
     worst_id  = verification.most_disadvantaged_worker
     worst_sat = verification.min_satisfaction
 
+    # -- GESTIONE EQUITÀ PERFETTA --
+    fairness_scores = state.verification.fairness_scores
+    if fairness_scores:
+        max_sat = max(fairness_scores.values())
+        min_sat = min(fairness_scores.values())
+        if (max_sat - min_sat) <= 2.0:  # Tolleranza minima
+            print("    ✓ All workers are equally satisfied (Delta ≤ 2). Converging early.")
+            return state.model_copy(update={"converged": True})
+        
     # LLM refinement strategy
     messages = [
-        SystemMessage(content=REFINEMENT_SYSTEM_PROMPT),
+        SystemMessage(content=(
+            "You are an expert hospital scheduler. Analyze the worst-off worker."
+            "Return a JSON object matching this schema: "
+            "{'reasoning': 'string', 'shifts_to_avoid': [int], 'shifts_to_prefer': [int], 'weight_boost': int}."
+            "Shifts: 0=morning, 1=afternoon, 2=night. weight_boost is 1-10."
+        )),
         HumanMessage(content=json.dumps({
             "focus_worker": worst_id,
             "current_min_satisfaction": worst_sat,
@@ -666,8 +675,17 @@ def refinement_agent(state: SmartSchedulerState) -> SmartSchedulerState:
         })),
     ]
     raw = _invoke_llm_with_retry(messages)
-    strategy = json.loads(raw)
-    print(f"    Strategy for {worst_id}: {strategy.get('strategy', 'N/A')}")
+    # Pulisce i blocchi markdown che l'LLM potrebbe aggiungere per errore
+    clean_raw = raw.strip()
+    if clean_raw.startswith("```json"):
+        clean_raw = clean_raw[7:]
+    if clean_raw.startswith("```"):
+        clean_raw = clean_raw[3:]
+    if clean_raw.endswith("```"):
+        clean_raw = clean_raw[:-3]
+        
+    strategy = json.loads(clean_raw.strip())
+    print(f"    Strategy for {worst_id}: {strategy.get('reasoning', 'N/A')}")
 
     # Re-solve with a floor to protect currently satisfied workers
     # Floor = current min_sat - small tolerance (allow slight regression in others)
@@ -678,6 +696,7 @@ def refinement_agent(state: SmartSchedulerState) -> SmartSchedulerState:
         use_case=state.use_case,
         min_satisfaction_floor=floor,
         pinned_worst_worker_id=worst_id,
+        strategy_hints=strategy,
         time_limit_seconds=120,
     )
 

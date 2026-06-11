@@ -48,6 +48,7 @@ def solve_schedule(
     use_case: str = "A",
     min_satisfaction_floor: float = 0.0,
     pinned_worst_worker_id: Optional[str] = None,
+    strategy_hints: dict | None = None,
     time_limit_seconds: int = 60,
 ) -> tuple[Optional[Schedule], dict[str, float]]:
     """
@@ -267,9 +268,48 @@ def solve_schedule(
         for sv in worker_sat:
             model.add(sv >= floor_int)
 
-    # Weighted objective: 70% total satisfaction + 30% min satisfaction
+
+    # ── AI Refinement Strategy Integration ────────────────────────────────────
+    # Inizializza i valori di default prima del blocco
+    pinned_idx = None
+    boost_weight = 5
+    
+    if pinned_worst_worker_id:
+        try:
+            pinned_idx = [wp.worker_id for wp in workers].index(pinned_worst_worker_id)
+            
+            floor_int = int((min_satisfaction_floor + 2.0) * SCALE)
+            model.add(worker_sat[pinned_idx] >= floor_int)
+            
+            # Applicazione deterministica dei parametri JSON
+            boost_weight = 5
+            if strategy_hints:
+                # 1. Vieta categoricamente i turni suggeriti
+                for s_avoid in strategy_hints.get("shifts_to_avoid", []):
+                    if s_avoid in SHIFTS:
+                        for d in DAYS:
+                            model.add(x[pinned_idx][d][s_avoid] == 0)
+                
+                # 2. Assegna un premio specifico per i turni da preferire
+                # (Questo altera i pesi della matrice interna di soddisfazione per questo specifico run)
+                for s_prefer in strategy_hints.get("shifts_to_prefer", []):
+                    if s_prefer in SHIFTS:
+                        for d in DAYS:
+                            model.add(x[pinned_idx][d][s_prefer] == 1) # Oppure usare un Hint morbido nel solver
+                            
+                # 3. Estrai il moltiplicatore deciso dall'IA
+                boost_weight = strategy_hints.get("weight_boost", 5)
+                        
+        except ValueError:
+            pass
+            
     total_sat = sum(worker_sat)
-    model.maximize(7 * total_sat + 3 * n_workers * min_sat)
+    
+    if pinned_worst_worker_id:
+        # L'obiettivo usa il boost dinamico suggerito dall'IA
+        model.maximize(7 * total_sat + 3 * n_workers * min_sat + boost_weight * worker_sat[pinned_idx])
+    else:
+        model.maximize(7 * total_sat + 3 * n_workers * min_sat)
 
     # ── Solve ─────────────────────────────────────────────────────────────────
     status = solver.solve(model)

@@ -105,3 +105,9 @@ class SmartSchedulerState(BaseModel):
     iteration:   int = 0
     converged:   bool = False
     history:     list[str] = Field(default_factory=list)  # log of actions
+    
+class RefinementStrategy(BaseModel):
+    reasoning: str = Field(description="Brief explanation of the strategy")
+    shifts_to_avoid: list[int] = Field(description="List of shift indices (0=morning, 1=afternoon, 2=night) to strictly ban for this worker", default=[])
+    shifts_to_prefer: list[int] = Field(description="List of shift indices to encourage", default=[])
+    weight_boost: int = Field(description="An integer multiplier from 1 to 10 to boost this worker's objective weight", default=5)
