@@ -18,18 +18,12 @@ from models import (
     Schedule, Assignment,
     ConstraintViolation, VerificationReport,
     SmartSchedulerState,
+    ExtensionSpec, ConstraintClassification, DynamicModeWarning,
 )
 from solver import solve_schedule
-
-
-# ── LLM factory ───────────────────────────────────────────────────────────────
-# _get_llm() is kept as a thin wrapper for backward compatibility.
-# All provider logic lives in llm_provider.py.
-
-def _get_llm():
-    return get_llm()
-
-
+from constraint_registry import build_classifier_context, get_extension_pattern_names
+from constraint_validator import validate_all_extensions, check_extension_compatibility
+    
 # ── Retry helper ──────────────────────────────────────────────────────────────
 
 def _invoke_llm_with_retry(messages: list, max_retries: int = 3, delay: float = 2.0) -> str:
@@ -42,7 +36,7 @@ def _invoke_llm_with_retry(messages: list, max_retries: int = 3, delay: float = 
     last_error: Exception | None = None
     for attempt in range(1, max_retries + 1):
         try:
-            llm = _get_llm()
+            llm = get_llm()
             response = llm.invoke(messages)
             raw = response.content.strip()
 
@@ -116,27 +110,37 @@ def _sanitise_workers(workers_raw: list[dict]) -> list[dict]:
 # STAGE 1 – Preferences Agent
 # ══════════════════════════════════════════════════════════════════════════════
 
-PREFERENCES_SYSTEM_PROMPT = """\
+def preferences_agent(state: SmartSchedulerState) -> SmartSchedulerState:
+    """
+    Stage 1: Parse worker preference descriptions and build WorkforcePreferences.
+    When called without real worker input (batch mode), uses the demo scenario.
+    """
+    print("\n[Stage 1] Preferences Agent running…")
+
+    use_case = state.use_case
+    input_file = state.input_file
+    if not input_file:
+        input_file = f"preferences_{use_case}.txt"
+    try:
+        with open(input_file, "r") as f:
+            raw_text = f.read()
+    except FileNotFoundError:
+        print(f"\n[!] Error: File '{input_file}' not found.")
+        raise
+
+    rules_file = getattr(state, "rules_file", None) or "system_rules.txt"
+    try:
+        with open(rules_file, "r") as f:
+            rules_text = f.read()
+    except FileNotFoundError:
+        print(f"\n[!] Error: Rules file '{rules_file}' not found.")
+        raise
+
+    system_prompt = f"""\
 You are a scheduling assistant for a hospital. Extract STRUCTURED preferences from
 natural language worker descriptions.
 
-RULES (follow exactly):
-1. preferred_shifts: list of SHIFT NAMES the worker EXPLICITLY prefers.
-   Only use values: "morning", "afternoon", "night". Empty list [] if none stated.
-2. avoided_shifts: list of SHIFT NAMES the worker EXPLICITLY wants to avoid.
-   Only use values: "morning", "afternoon", "night". Empty list [] if none stated.
-   NEVER put non-shift strings (like "consecutive holidays") here.
-3. night_tolerance: true by default. Set false ONLY if the worker EXPLICITLY says
-   they do NOT want or cannot do night shifts.
-4. holiday_tolerance: true by default. Set false ONLY if the worker EXPLICITLY says
-   they refuse holiday work.
-5. unavailable_days_of_week: list of day integers (0=Mon,1=Tue,2=Wed,3=Thu,4=Fri,5=Sat,6=Sun)
-   Set ONLY days when the worker says they are COMPLETELY UNAVAILABLE (e.g. "not available on Sundays").
-   DO NOT add days for soft preferences like "prefers not to work on..." or "would rather avoid...".
-   Use preferred_rest_day for soft day preferences instead.
-   IMPORTANT: Keep this list to AT MOST 2 days. If in doubt, use empty list [].
-6. preferred_rest_day: integer (0-6) or null. Use for SOFT preference ("prefers Saturdays off").
-7. emergency_coverage: integer, extra shifts accepted per month. Default 0.
+{rules_text}
 
 Return a JSON object with key "workers" containing the list.
 Each object must have ALL fields: worker_id, worker_name, worker_type, preferred_shifts,
@@ -146,26 +150,9 @@ preferred_rest_day, emergency_coverage.
 Only output valid JSON, no extra text.
 """
 
-
-def preferences_agent(state: SmartSchedulerState) -> SmartSchedulerState:
-    """
-    Stage 1: Parse worker preference descriptions and build WorkforcePreferences.
-    When called without real worker input (batch mode), uses the demo scenario.
-    """
-    print("\n[Stage 1] Preferences Agent running…")
-
-    # In demo / automated mode we generate synthetic preference descriptions
-    # matching the use case configuration.
-    use_case = state.use_case
-
-    if use_case == "A":
-        raw_descriptions = _demo_preferences_A()
-    else:
-        raw_descriptions = _demo_preferences_B()
-
     messages = [
-        SystemMessage(content=PREFERENCES_SYSTEM_PROMPT),
-        HumanMessage(content=json.dumps({"worker_descriptions": raw_descriptions})),
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=f"Worker descriptions:\n{raw_text}"),
     ]
 
     raw_json = _invoke_llm_with_retry(messages)
@@ -183,132 +170,236 @@ def preferences_agent(state: SmartSchedulerState) -> SmartSchedulerState:
     return state
 
 
-# ── Demo preference descriptions ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+#STAGE 1a – Constraint Classifier Agent (FASE 1a / FASE 1b)
+# ──────────────────────────────────────────────────────────────────────────────
 
-def _demo_preferences_A() -> list[dict]:
-    """Synthetic preference descriptions for Use Case A (10 homogeneous workers)."""
-    return [
-        {
-            "worker_id": "W01", "worker_name": "Alice Rossi", "worker_type": "standard",
-            "description": (
-                "Alice prefers morning shifts and would like to avoid night shifts whenever possible. "
-                "She is not available on Sundays. Her preferred rest day is Saturday."
-            )
-        },
-        {
-            "worker_id": "W02", "worker_name": "Bruno Conti", "worker_type": "standard",
-            "description": (
-                "Bruno can work during weekends but not on consecutive holidays. "
-                "He tolerates night shifts and is available for emergency coverage twice a month."
-            )
-        },
-        {
-            "worker_id": "W03", "worker_name": "Carla Esposito", "worker_type": "standard",
-            "description": (
-                "Carla prefers afternoon shifts. She does not mind night shifts "
-                "but would like Christmas day off if possible."
-            )
-        },
-        {
-            "worker_id": "W04", "worker_name": "Davide Ferrari", "worker_type": "standard",
-            "description": (
-                "Davide prefers morning shifts. He strongly dislikes night shifts "
-                "and is unavailable on Mondays."
-            )
-        },
-        {
-            "worker_id": "W05", "worker_name": "Elena Gallo", "worker_type": "standard",
-            "description": (
-                "Elena has no strong shift preferences. She accepts all shift types "
-                "and holiday work. Preferred rest day is Wednesday."
-            )
-        },
-        {
-            "worker_id": "W06", "worker_name": "Francesco Bianchi", "worker_type": "standard",
-            "description": (
-                "Francesco prefers afternoon and night shifts. He is available on holidays "
-                "and is willing to cover up to three emergency shifts per month."
-            )
-        },
-        {
-            "worker_id": "W07", "worker_name": "Giulia Marini", "worker_type": "standard",
-            "description": (
-                "Giulia prefers morning shifts and would like to avoid working on weekends. "
-                "She has low tolerance for night shifts."
-            )
-        },
-        {
-            "worker_id": "W08", "worker_name": "Hector Romano", "worker_type": "standard",
-            "description": (
-                "Hector accepts any shift type. He prefers to have Thursdays as rest days. "
-                "He is comfortable with night and holiday shifts."
-            )
-        },
-        {
-            "worker_id": "W09", "worker_name": "Irene Costa", "worker_type": "standard",
-            "description": (
-                "Irene prefers afternoon shifts. She would like to avoid night shifts but "
-                "can handle one or two per month if needed."
-            )
-        },
-        {
-            "worker_id": "W10", "worker_name": "Luca Vitale", "worker_type": "standard",
-            "description": (
-                "Luca has no strong preferences. He is available all days and tolerates "
-                "all shift types. He sees himself as a flexible team player."
-            )
-        },
+def _build_classifier_system_prompt() -> str:
+    """
+    Costruisce dinamicamente il system prompt del Classificatore a partire
+    dal registro dei vincoli. Ogni modifica al registro si riflette automaticamente
+    nel comportamento del classificatore.
+    """
+    registry_context = build_classifier_context()
+    return f"""\
+Sei un classificatore di vincoli di scheduling ospedaliero. Il tuo compito è analizzare
+i vincoli richiesti dall'utente e classificarli come "noti" (mappabili sul solver statico)
+o "nuovi" (non supportati o da mappare su Extension Pattern).
+
+NON generare codice Python. NON generare codice OR-Tools. Produci SOLO JSON strutturato.
+
+{registry_context}
+
+ISTRUZIONI DI CLASSIFICAZIONE:
+1. Analizza attentamente ogni vincolo nella richiesta dell'utente.
+2. Se TUTTI i vincoli sono mappabili sui "VINCOLI NOTI": imposta classification="known".
+3. Se ALCUNI vincoli sono nuovi MA mappabili su "EXTENSION PATTERN": imposta classification="mixed".
+4. Se un vincolo non è mappabile su nessun pattern: imposta classification="refused".
+5. Per ogni ExtensionSpec, includi il testo originale dell'utente in source_text.
+
+RIPONDI SEMPRE con un JSON valido in questo formato:
+{{
+  "classification": "known" | "mixed" | "refused",
+  "known_params": {{
+    "use_case": "A" | "B",
+    "notes": "breve descrizione dei vincoli noti identificati"
+  }},
+  "extensions": [
+    {{
+      "extension_type": "<nome_del_pattern>",
+      "parameters": {{"param1": valore1, "param2": valore2}},
+      "source_text": "<testo originale dell'utente che ha generato questo vincolo>"
+    }}
+  ],
+  "unmappable_constraints": ["<descrizione vincolo non mappabile 1>", ...],
+  "reasoning": "<breve spiegazione della classificazione>"
+}}
+
+Solo JSON valido, nessun testo aggiuntivo.
+"""
+
+
+def constraint_classifier_agent(state: SmartSchedulerState) -> SmartSchedulerState:
+    """
+    FASE 1a: Valutazione Statica (Priorità Assoluta).
+
+    Analizza i vincoli richiesti dall'utente. Se TUTTI i vincoli possono essere
+    mappati sui Casi Noti, estrae i parametri e compila il JSON per il solver statico.
+    NON genera codice.
+
+    Se alcuni vincoli sono nuovi ma mappabili su Extension Pattern, imposta
+    classification='mixed' e passa il controllo al dynamic_extension_agent.
+
+    Se un vincolo è completamente non mappabile, imposta classification='refused'.
+    """
+    print("\n[Stage 1a] Constraint Classifier Agent running…")
+
+    # In modalità demo, i vincoli provengono dalla configurazione interna.
+    # In produzione, questo verrebbe sostituito dall'input dell'utente.
+    use_case = state.use_case
+    user_request = (
+        f"Scheduling ospedaliero Use Case {use_case}: "
+        f"vincoli standard H1-H7 e soft constraints S1-S5 come da configurazione."
+    )
+
+    messages = [
+        SystemMessage(content=_build_classifier_system_prompt()),
+        HumanMessage(content=json.dumps({
+            "user_request": user_request,
+            "use_case": use_case,
+            "additional_constraints": state.history[-1] if state.history else "",
+        })),
     ]
 
+    try:
+        raw_json = _invoke_llm_with_retry(messages)
+        data = json.loads(raw_json)
+    except RuntimeError as exc:
+        print(f"    ⚠ Classificatore fallito, fallback su 'known': {exc}")
+        # Fallback sicuro: se il classificatore fallisce, usa il percorso statico
+        data = {
+            "classification": "known",
+            "known_params": {"use_case": use_case, "notes": "fallback automatico"},
+            "extensions": [],
+            "unmappable_constraints": [],
+        }
 
-def _demo_preferences_B() -> list[dict]:
-    """Synthetic preference descriptions for Use Case B (10 standard + 6 specialized)."""
-    standard = _demo_preferences_A()
-    specialized = [
-        {
-            "worker_id": "S01", "worker_name": "Marco Ricci", "worker_type": "specialized",
-            "description": (
-                "Marco is a specialized doctor. He prefers morning shifts and has low "
-                "tolerance for consecutive night shifts. He is unavailable on Sundays."
-            )
-        },
-        {
-            "worker_id": "S02", "worker_name": "Nadia Fontana", "worker_type": "specialized",
-            "description": (
-                "Nadia is a specialist. She prefers afternoon shifts and is comfortable "
-                "with holiday work. Preferred rest day is Friday."
-            )
-        },
-        {
-            "worker_id": "S03", "worker_name": "Omar Greco", "worker_type": "specialized",
-            "description": (
-                "Omar works as a specialist. He has no strong preferences and is "
-                "available for emergency coverage up to three times a month."
-            )
-        },
-        {
-            "worker_id": "S04", "worker_name": "Paola Serra", "worker_type": "specialized",
-            "description": (
-                "Paola is a specialized nurse. She prefers morning and avoids night shifts. "
-                "She is unavailable on Tuesdays."
-            )
-        },
-        {
-            "worker_id": "S05", "worker_name": "Quirino De Luca", "worker_type": "specialized",
-            "description": (
-                "Quirino is a specialist who prefers afternoon shifts. He tolerates night "
-                "shifts with low frequency and accepts holiday work."
-            )
-        },
-        {
-            "worker_id": "S06", "worker_name": "Rosa Amato", "worker_type": "specialized",
-            "description": (
-                "Rosa is a specialized technician. She has a strong preference for morning "
-                "shifts and does not want to work on weekends or holidays."
-            )
-        },
-    ]
-    return standard + specialized
+    classification_str = data.get("classification", "known")
+    extensions_raw = data.get("extensions", [])
+    unmappable = data.get("unmappable_constraints", [])
+    known_params = data.get("known_params", {})
+
+    print(f"    Classificazione: {classification_str.upper()}")
+    if data.get("reasoning"):
+        print(f"    Ragionamento: {data['reasoning']}")
+
+    # Costruiamo l'oggetto ConstraintClassification
+    warning = None
+    if classification_str == "mixed":
+        ext_types = [e.get("extension_type", "?") for e in extensions_raw]
+        warning = DynamicModeWarning(
+            risk_level="MEDIUM",
+            unknown_constraints=unmappable,
+            extensions_to_apply=ext_types,
+        )
+        print(f"    ⚠ AVVISO MODALITÀ DINAMICA: {warning.warning_message}")
+        print(f"    Extension da applicare: {ext_types}")
+    elif classification_str == "refused":
+        print(f"    ❌ RIFIUTO: vincoli non mappabili: {unmappable}")
+        warning = DynamicModeWarning(
+            risk_level="HIGH",
+            unknown_constraints=unmappable,
+            extensions_to_apply=[],
+            warning_message=(
+                f"❌ RICHIESTA RIFIUTATA: i seguenti vincoli non possono essere mappati "
+                f"su nessun pattern sicuro noto: {unmappable}. "
+                "Modificare la richiesta o contattare il team di ingegneria."
+            ),
+        )
+
+    # Costruiamo gli ExtensionSpec (solo se mixed)
+    extensions: list[ExtensionSpec] = []
+    if classification_str == "mixed":
+        for ext_data in extensions_raw:
+            try:
+                extensions.append(ExtensionSpec(
+                    extension_type=ext_data["extension_type"],
+                    parameters=ext_data.get("parameters", {}),
+                    source_text=ext_data.get("source_text", ""),
+                ))
+            except Exception as exc:
+                print(f"    ⚠ ExtensionSpec non valido ignorato: {exc}")
+
+    classification = ConstraintClassification(
+        classification=classification_str,
+        known_params=known_params,
+        extensions=extensions,
+        unmappable_constraints=unmappable,
+        warning=warning,
+    )
+
+    refusal_reason = None
+    if classification_str == "refused":
+        refusal_reason = (
+            f"Vincoli non mappabili: {unmappable}. "
+            "Nessun codice generato. Nessuna azione eseguita."
+        )
+
+    print(f"    ✓ Classificazione completata: {classification_str.upper()}")
+    return state.model_copy(update={
+        "constraint_classification": classification,
+        "dynamic_mode_active": classification_str == "mixed",
+        "refusal_reason": refusal_reason,
+        "history": state.history + [
+            f"[S1a] Classificazione: {classification_str.upper()}. "
+            f"Extensions: {[e.extension_type for e in extensions]}. "
+            f"Non mappabili: {unmappable}."
+        ],
+    })
+
+
+def dynamic_extension_agent(state: SmartSchedulerState) -> SmartSchedulerState:
+    """
+    FASE 1b: Generazione Dinamica (Caso Eccezionale).
+
+    Riceve un ConstraintClassification con classification='mixed' e:
+    1. Stampa l'avviso formale all'utente
+    2. Valida strutturalmente ogni ExtensionSpec
+    3. Controlla la compatibilità tra estensioni
+    4. Se tutto è valido, aggiorna lo stato per procedere con il solver
+    5. Se la validazione fallisce, scala a 'refused'
+
+    GARANZIA: non genera né esegue codice Python a runtime.
+    """
+    print("\n[Stage 1b] Dynamic Extension Agent running…")
+
+    clf = state.constraint_classification
+    if clf is None or clf.classification != "mixed":
+        print("    Nessuna estensione da processare.")
+        return state
+
+    workers = state.preferences.workers if state.preferences else []
+
+    # ── Avviso formale ────────────────────────────────────────────────────────
+    if clf.warning:
+        print(f"\n    {'='*60}")
+        print(f"    ⚠️  {clf.warning.warning_message}")
+        print(f"    {'='*60}")
+
+    # ── Validazione strutturale ───────────────────────────────────────────────
+    validation_report = validate_all_extensions(clf.extensions, workers)
+    print(validation_report.summary())
+
+    if not validation_report.all_passed:
+        refusal = (
+            f"Validazione degli ExtensionSpec fallita. Errori: {validation_report.errors}. "
+            "Nessun codice generato. Nessuna azione eseguita."
+        )
+        print(f"    ❌ {refusal}")
+        return state.model_copy(update={
+            "dynamic_mode_active": False,
+            "refusal_reason": refusal,
+            "constraint_classification": clf.model_copy(update={"classification": "refused"}),
+            "history": state.history + [f"[S1b] Validazione FALLITA: {validation_report.errors}"],
+        })
+
+    # ── Controllo compatibilità tra estensioni ───────────────────────────────────
+    compat_warnings = check_extension_compatibility(clf.extensions)
+    for w in compat_warnings:
+        print(f"    ⚠ Compatibilità: {w}")
+
+    print(f"    ✓ Validazione completata. {len(clf.extensions)} extension(s) pronte.")
+    return state.model_copy(update={
+        "dynamic_mode_active": True,
+        "history": state.history + [
+            f"[S1b] Validazione OK. Extensions: "
+            f"{[e.extension_type for e in clf.extensions]}. "
+            f"Avvisi compatibilità: {len(compat_warnings)}."
+        ],
+    })
+
+
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -336,6 +427,7 @@ def drafting_agent(state: SmartSchedulerState) -> SmartSchedulerState:
     """
     Stage 2: Generate the initial schedule using the CP-SAT solver.
     The LLM provides strategic reasoning; the solver produces the actual schedule.
+    Passes any validated extensions (Fase 1b) to solve_schedule().
     """
     print("\n[Stage 2] Drafting Agent running…")
 
@@ -356,11 +448,19 @@ def drafting_agent(state: SmartSchedulerState) -> SmartSchedulerState:
     strategy = json.loads(raw)
     print(f"    Strategy: {strategy.get('strategy_notes', 'N/A')}")
 
+    # Recupera le extensions validate dalla Fase 1b (se presenti)
+    extensions = None
+    clf = state.constraint_classification
+    if state.dynamic_mode_active and clf and clf.extensions:
+        extensions = clf.extensions
+        print(f"    [Fase 1b] Applicando {len(extensions)} extension(s) al solver.")
+
     # Call the CP-SAT solver
     schedule, sat_scores = solve_schedule(
         workers=workers,
         use_case=state.use_case,
         time_limit_seconds=120,
+        extensions=extensions,
     )
 
     if schedule is None:

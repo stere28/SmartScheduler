@@ -21,7 +21,7 @@ from config import (
     WEIGHT_HOLIDAY_TOLERANCE, WEIGHT_HOLIDAY_NO_TOLERANCE,
     WEIGHT_REST_DAY_MET,
 )
-from models import ShiftPreference, Schedule, Assignment
+from models import ShiftPreference, Schedule, Assignment, ExtensionSpec
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -49,6 +49,7 @@ def solve_schedule(
     min_satisfaction_floor: float = 0.0,
     pinned_worst_worker_id: Optional[str] = None,
     time_limit_seconds: int = 60,
+    extensions: Optional[list[ExtensionSpec]] = None,
 ) -> tuple[Optional[Schedule], dict[str, float]]:
     """
     Build and solve the CP-SAT model.
@@ -61,6 +62,13 @@ def solve_schedule(
         pinned_worst_worker_id:  During refinement, the ID of the worst-off worker whose
                                  satisfaction we want to explicitly improve.
         time_limit_seconds:      CP-SAT wall-clock limit.
+        extensions:              Opzionale. Lista di ExtensionSpec validati da applicare
+                                 dopo i vincoli hard standard (Fase 1b). Se None o vuota,
+                                 il solver si comporta esattamente come nella versione statica.
+                                 IMPORTANTE: questi ExtensionSpec devono essere stati
+                                 validati da constraint_validator.py PRIMA di essere
+                                 passati qui. Il solver non esegue ulteriori controlli
+                                 di sicurezza sui parametri.
 
     Returns:
         (schedule, satisfaction_scores) or (None, {}) if infeasible.
@@ -173,6 +181,16 @@ def solve_schedule(
                 if dow in wp.unavailable_days_of_week:
                     for s in SHIFTS:
                         model.add(x[w][d][s] == 0)
+
+    # ── Extension Pattern Constraints (Fase 1b) ────────────────────────────────
+    # Applicati DOPO i vincoli hard statici. I vincoli H1-H7 rimangono sempre
+    # attivi e non possono essere sovrascritti da queste estensioni.
+    # Gli ExtensionSpec devono essere pre-validati da constraint_validator.py.
+    if extensions:
+        from solver_extensions import apply_extension
+        for ext in extensions:
+            apply_extension(model, x, workers, ext)
+            print(f"    [Extension] Applicato: {ext.extension_type} {ext.parameters}")
 
     # ── Soft Constraints (penalty / bonus terms) ───────────────────────────────
     SCALE = 100   # scale factor to keep integers manageable
