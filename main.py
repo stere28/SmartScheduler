@@ -31,14 +31,6 @@ def main() -> None:
         help="Use Case A (homogeneous, 10 workers) or B (std+specialized, 16 workers)",
     )
     parser.add_argument(
-        "--input-file", type=str, default=None,
-        help="Path to txt file with worker preferences. If not provided, defaults to preferences_A.txt or preferences_B.txt",
-    )
-    parser.add_argument(
-        "--rules-file", type=str, default="system_rules.txt",
-        help="Path to txt file with system prompt rules.",
-    )
-    parser.add_argument(
         "--no-llm", action="store_true",
         help="Skip LLM agents; run the CP-SAT solver directly (no provider required).",
     )
@@ -61,7 +53,7 @@ def main() -> None:
     from pipeline import run_pipeline
     from output import print_schedule, print_worker_stats, export_csv, export_json
 
-    final_state = run_pipeline(use_case=args.use_case, input_file=args.input_file, rules_file=args.rules_file)
+    final_state = run_pipeline(use_case=args.use_case)
 
     print(f"\n{'='*70}")
     print("  Pipeline complete.")
