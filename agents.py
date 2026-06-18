@@ -21,15 +21,6 @@ from models import (
 )
 from solver import solve_schedule
 
-
-# ── LLM factory ───────────────────────────────────────────────────────────────
-# _get_llm() is kept as a thin wrapper for backward compatibility.
-# All provider logic lives in llm_provider.py.
-
-def _get_llm():
-    return get_llm()
-
-
 # ── Retry helper ──────────────────────────────────────────────────────────────
 
 def _invoke_llm_with_retry(messages: list, max_retries: int = 3, delay: float = 2.0) -> str:
@@ -42,7 +33,7 @@ def _invoke_llm_with_retry(messages: list, max_retries: int = 3, delay: float = 
     last_error: Exception | None = None
     for attempt in range(1, max_retries + 1):
         try:
-            llm = _get_llm()
+            llm = get_llm()
             response = llm.invoke(messages)
             raw = response.content.strip()
 
@@ -154,8 +145,6 @@ def preferences_agent(state: SmartSchedulerState) -> SmartSchedulerState:
     """
     print("\n[Stage 1] Preferences Agent running…")
 
-    # In demo / automated mode we generate synthetic preference descriptions
-    # matching the use case configuration.
     use_case = state.use_case
 
     if use_case == "A":
@@ -183,7 +172,6 @@ def preferences_agent(state: SmartSchedulerState) -> SmartSchedulerState:
     return state
 
 
-# ── Demo preference descriptions ──────────────────────────────────────────────
 
 def _demo_preferences_A() -> list[dict]:
     """Synthetic preference descriptions for Use Case A (10 homogeneous workers)."""
