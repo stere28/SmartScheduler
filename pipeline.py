@@ -1,7 +1,7 @@
 """
 SmartScheduler – LangGraph Pipeline
 ======================================
-Wires together the four agents into a stateful graph with a refinement loop.
+Wires together the agents into a stateful graph.
 """
 
 from __future__ import annotations
@@ -12,15 +12,15 @@ from langgraph.graph import StateGraph, END
 from models import SmartSchedulerState
 from agents import (
     preferences_agent,
-    drafting_agent,
+    llm_drafting_agent,
+    solver_drafting_agent,
     verification_agent,
     refinement_agent,
 )
-from config import MAX_REFINEMENT_ITERATIONS
+from config import MAX_REFINEMENT_ITERATIONS, MAX_DRAFT_ITERATIONS
 
 
 # ── Node wrappers ──────────────────────────────────────────────────────────────
-# LangGraph nodes receive and return dict-compatible state objects.
 
 def _preferences_node(state: dict) -> dict:
     s = SmartSchedulerState(**state)
@@ -28,9 +28,15 @@ def _preferences_node(state: dict) -> dict:
     return result.model_dump()
 
 
-def _drafting_node(state: dict) -> dict:
+def _llm_drafting_node(state: dict) -> dict:
     s = SmartSchedulerState(**state)
-    result = drafting_agent(s)
+    result = llm_drafting_agent(s)
+    return result.model_dump()
+
+
+def _solver_drafting_node(state: dict) -> dict:
+    s = SmartSchedulerState(**state)
+    result = solver_drafting_agent(s)
     return result.model_dump()
 
 
@@ -48,25 +54,30 @@ def _refinement_node(state: dict) -> dict:
 
 # ── Routing functions ──────────────────────────────────────────────────────────
 
-def _route_after_verification(state: dict) -> Literal["refinement", "end"]:
-    """After verification: if passed and not converged, refine; else end."""
+def _route_after_verification(state: dict,) -> Literal["refinement", "drafting_llm", "drafting_solver", "end"]:
+    """
+    After verification:
+    """
     s = SmartSchedulerState(**state)
-    if s.verification is None:
-        return "end"
-    if not s.verification.passed:
-        # Hard constraint violation → re-draft (here we end; re-draft loop optional)
-        return "end"
-    if s.converged or s.iteration >= MAX_REFINEMENT_ITERATIONS:
-        return "end"
-    return "refinement"
+
+    if s.verification_passed:
+        return "refinement"
+
+    if s.iteration_draft < MAX_DRAFT_ITERATIONS:
+        return "drafting_llm"
+    return "drafting_solver"
 
 
-def _route_after_refinement(state: dict) -> Literal["verify", "end"]:
-    """After refinement: re-verify, unless converged."""
+def _route_after_refinement(state: dict) -> Literal["verification", "end"]:
+    """
+    After refinement: re-verify, unless converged.
+    """
     s = SmartSchedulerState(**state)
-    if s.converged or s.iteration >= MAX_REFINEMENT_ITERATIONS:
+    if s.converged:
         return "end"
-    return "verify"
+    if s.iteration_draft < MAX_REFINEMENT_ITERATIONS:
+        return "drafting_llm"
+    return "drafting_solver"
 
 
 # ── Build graph ────────────────────────────────────────────────────────────────
@@ -75,28 +86,34 @@ def build_pipeline() -> StateGraph:
     g = StateGraph(dict)
 
     # Register nodes
-    g.add_node("preferences", _preferences_node)
-    g.add_node("drafting",    _drafting_node)
-    g.add_node("verification", _verification_node)
-    g.add_node("refinement",  _refinement_node)
+    g.add_node("preferences",       _preferences_node)
+    g.add_node("drafting_llm",      _llm_drafting_node)       
+    g.add_node("drafting_solver",   _solver_drafting_node)    
+    g.add_node("verification",      _verification_node)       
+    g.add_node("refinement",        _refinement_node)         
 
     # Entry point
     g.set_entry_point("preferences")
 
-    # Edges
-    g.add_edge("preferences", "drafting")
-    g.add_edge("drafting",    "verification")
-
+    g.add_edges("preferences", "drafting_llm")
+    g.add_edge("drafting_llm",    "verification")
+    g.add_edge("drafting_solver", END)
+    # Verification → refinement | back to drafting | end
     g.add_conditional_edges(
         "verification",
         _route_after_verification,
-        {"refinement": "refinement", "end": END},
+        {
+            "refinement":      "refinement",
+            "drafting_llm":    "drafting_llm",
+            "drafting_solver": "drafting_solver"
+        },
     )
 
     g.add_conditional_edges(
         "refinement",
         _route_after_refinement,
-        {"verify": "verification", "end": END},
+        {"verification": "verification", 
+         "end": END},
     )
 
     return g.compile()
