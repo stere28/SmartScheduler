@@ -41,6 +41,188 @@ def _week_of(day_index: int) -> int:
     return day_index // 7
 
 
+# ── Hard-constraint verifier (no solving) ─────────────────────────────────────
+
+def verify_hard_constraints(
+    schedule: "Schedule",
+    workers: list["ShiftPreference"],
+    use_case: str = "A",
+) -> dict[str, list[str]]:
+    """
+    Verify all hard constraints on an already-produced Schedule.
+
+    Does NOT run OR-Tools: it simply inspects the Assignment list and checks
+    each rule symbolically.  This is the canonical verifier used by Stage 3 so
+    that the constraint logic is defined in one place only.
+
+    Returns
+    -------
+    violations_by_rule : dict[str, list[str]]
+        Keys are short constraint labels (e.g. "H1_staffing").
+        Values are human-readable violation descriptions.
+        An empty dict means the schedule passes all hard constraints.
+    """
+    from collections import defaultdict
+    from config import (
+        SHIFT_NAMES, SHIFT_WEIGHT, SHIFT_HOURS,
+        FREE_DAYS_AFTER_NIGHT, TARGET_SHIFTS_MONTH,
+        MAX_HOURS_PER_WEEK, DATES,
+    )
+
+    violations: dict[str, list[str]] = defaultdict(list)
+
+    # ── Build lookup structures ────────────────────────────────────────────────
+    # assign_map[worker_id][day_index] = shift_index
+    assign_map: dict[str, dict[int, int]] = defaultdict(dict)
+    for a in schedule.assignments:
+        assign_map[a.worker_id][a.day_index] = a.shift_index
+
+    # shift_staff[(day, shift)] = [worker_id, …]
+    shift_staff: dict[tuple, list] = defaultdict(list)
+    for a in schedule.assignments:
+        shift_staff[(a.day_index, a.shift_index)].append(a.worker_id)
+
+    num_days = len(DATES)
+    num_weeks = math.ceil(num_days / 7)
+
+    def _wtype(wid: str) -> str:
+        for w in workers:
+            if w.worker_id == wid:
+                return w.worker_type
+        return "standard"
+
+    # ── H1: minimum staffing per shift ────────────────────────────────────────
+    for d in range(num_days):
+        for s in range(3):
+            staff = shift_staff[(d, s)]
+            date_str = DATES[d].strftime("%Y-%m-%d")
+            shift_label = f"{date_str} [{SHIFT_NAMES[s]}]"
+            if use_case == "A":
+                if len(staff) < 2:
+                    violations["H1_staffing"].append(
+                        f"  • {shift_label}: {len(staff)} worker(s) assigned, need ≥ 2."
+                    )
+            else:
+                n_spec = sum(1 for wid in staff if _wtype(wid) == "specialized")
+                n_std  = sum(1 for wid in staff if _wtype(wid) == "standard")
+                if n_spec < 1:
+                    violations["H1_staffing"].append(
+                        f"  • {shift_label}: no specialized worker (need ≥ 1)."
+                    )
+                if n_std < 1:
+                    violations["H1_staffing"].append(
+                        f"  • {shift_label}: no standard worker (need ≥ 1)."
+                    )
+                if len(staff) < 3:
+                    violations["H1_staffing"].append(
+                        f"  • {shift_label}: {len(staff)} total worker(s), need ≥ 3."
+                    )
+
+    # ── H2: at most 1 shift per worker per day ────────────────────────────────
+    for wp in workers:
+        for d in range(num_days):
+            shifts_today = [
+                a for a in schedule.assignments
+                if a.worker_id == wp.worker_id and a.day_index == d
+            ]
+            if len(shifts_today) > 1:
+                violations["H2_one_shift_per_day"].append(
+                    f"  • Worker {wp.worker_id} ({wp.worker_name}): "
+                    f"{len(shifts_today)} shifts on {DATES[d].strftime('%Y-%m-%d')} "
+                    f"(shifts: {[SHIFT_NAMES[a.shift_index] for a in shifts_today]})."
+                )
+
+    # ── H3: no night→morning across consecutive days ─────────────────────────
+    for wp in workers:
+        for d in range(num_days - 1):
+            # 2 = Night, 0 = Morning
+            if (assign_map[wp.worker_id].get(d) == 2 and 
+                    assign_map[wp.worker_id].get(d + 1) == 0):
+                violations["H3_no_consecutive"].append(
+                    f"  • Worker {wp.worker_id} ({wp.worker_name}): "
+                    f"night on {DATES[d].strftime('%Y-%m-%d')} "
+                    f"followed by morning on {DATES[d+1].strftime('%Y-%m-%d')}."
+                )
+
+    # ── H4: 2 mandatory free days after each night shift ─────────────────────
+    for wp in workers:
+        for d in range(num_days):
+            if assign_map[wp.worker_id].get(d) == 2:   # night
+                for offset in range(1, FREE_DAYS_AFTER_NIGHT + 1):
+                    next_d = d + offset
+                    if next_d < num_days and next_d in assign_map[wp.worker_id]:
+                        violations["H4_rest_after_night"].append(
+                            f"  • Worker {wp.worker_id} ({wp.worker_name}): "
+                            f"night on {DATES[d].strftime('%Y-%m-%d')}, "
+                            f"but works {DATES[next_d].strftime('%Y-%m-%d')} "
+                            f"(mandatory rest day {offset} violated)."
+                        )
+
+    # ── H5: total workload == TARGET_SHIFTS_MONTH ─────────────────────────────
+    for wp in workers:
+        total = sum(
+            SHIFT_WEIGHT[a.shift_index]
+            for a in schedule.assignments if a.worker_id == wp.worker_id
+        )
+        if total != TARGET_SHIFTS_MONTH:
+            violations["H5_workload"].append(
+                f"  • Worker {wp.worker_id} ({wp.worker_name}): "
+                f"workload = {total} units, expected exactly {TARGET_SHIFTS_MONTH}."
+            )
+
+    # ── H6: weekly hours ≤ MAX_HOURS_PER_WEEK ────────────────────────────────
+    for wp in workers:
+        for wk in range(num_weeks):
+            day_start = wk * 7
+            day_end   = min(day_start + 7, num_days)
+            hours = sum(
+                SHIFT_HOURS[assign_map[wp.worker_id][d]]
+                for d in range(day_start, day_end)
+                if d in assign_map[wp.worker_id]
+            )
+            if hours > MAX_HOURS_PER_WEEK:
+                week_start_date = DATES[day_start].strftime("%Y-%m-%d")
+                violations["H6_weekly_hours"].append(
+                    f"  • Worker {wp.worker_id} ({wp.worker_name}): "
+                    f"week starting {week_start_date} → {hours}h > {MAX_HOURS_PER_WEEK}h limit."
+                )
+
+    # ── H7: at least 1 rest day per week ─────────────────────────────────────
+    for wp in workers:
+        for wk in range(num_weeks):
+            day_start  = wk * 7
+            day_end    = min(day_start + 7, num_days)
+            worked_days = sum(
+                1 for d in range(day_start, day_end)
+                if d in assign_map[wp.worker_id]
+            )
+            if worked_days == (day_end - day_start):
+                week_start_date = DATES[day_start].strftime("%Y-%m-%d")
+                violations["H7_weekly_rest"].append(
+                    f"  • Worker {wp.worker_id} ({wp.worker_name}): "
+                    f"0 rest days in week starting {week_start_date} "
+                    f"(worked all {worked_days} days)."
+                )
+
+    # ── H8: worker unavailability (hard day-of-week blocks) ──────────────────
+    for wp in workers:
+        if not wp.unavailable_days_of_week:
+            continue
+        for a in schedule.assignments:
+            if a.worker_id != wp.worker_id:
+                continue
+            dow = DATES[a.day_index].weekday()
+            if dow in wp.unavailable_days_of_week:
+                day_names = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+                violations["H8_unavailability"].append(
+                    f"  • Worker {wp.worker_id} ({wp.worker_name}): "
+                    f"assigned on {DATES[a.day_index].strftime('%Y-%m-%d')} "
+                    f"({day_names[dow]}) but declared unavailable on {day_names[dow]}s."
+                )
+
+    return dict(violations)
+
+
 # ── Main solver function ───────────────────────────────────────────────────────
 
 def solve_schedule(
@@ -166,7 +348,30 @@ def solve_schedule(
             )
             model.add(week_hours <= MAX_HOURS_PER_WEEK)
 
-    # (H7) Worker unavailability (day-of-week constraints from preferences)
+    # (H7) Almeno 1 giorno di riposo a settimana
+    # Utilizziamo 'num_weeks' già calcolato nel vincolo H6
+    for w in WORKERS:
+        for wk in range(num_weeks):
+            day_start = wk * 7
+            day_end   = min(day_start + 7, NUM_DAYS)
+            
+            # Calcoliamo quanti giorni totali ci sono in questa specifica "settimana"
+            # (l'ultima settimana del mese potrebbe avere meno di 7 giorni)
+            days_in_block = day_end - day_start
+            
+            # Somma di tutti i turni assegnati al lavoratore in questa settimana
+            worked_days_in_block = sum(
+                x[w][d][s] 
+                for d in range(day_start, day_end) 
+                for s in SHIFTS
+            )
+            
+            # Per avere almeno un giorno di riposo, i giorni lavorati devono essere
+            # minori o uguali ai giorni totali del blocco meno 1.
+            model.add(worked_days_in_block <= days_in_block - 1)
+
+    # (H8) Worker unavailability (day-of-week constraints from preferences)
+    # (Rinomina il vecchio commento H7 in H8 per mantenere la coerenza numerica con il verifier)
     for w, wp in enumerate(workers):
         if wp.unavailable_days_of_week:
             for d in DAYS:

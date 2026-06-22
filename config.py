@@ -56,6 +56,7 @@ LLM_TEMPERATURE = float(_os.environ.get("LLM_TEMPERATURE", "0.2"))
 OLLAMA_BASE_URL = _os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 
 MAX_REFINEMENT_ITERATIONS = 8
+MAX_DRAFTING_ATTEMPTS     = 5   # max correction loops between Stage 2 and Stage 3
 
 # ── Fairness ──────────────────────────────────────────────────────────────────
 # Satisfaction score weights (soft preferences contribute to a 0-100 score)

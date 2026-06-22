@@ -105,6 +105,17 @@ class SmartSchedulerState(BaseModel):
     iteration:   int = 0
     converged:   bool = False
     history:     list[str] = Field(default_factory=list)  # log of actions
+
+    # ── Stage 2 ↔ Stage 3 feedback loop ───────────────────────────────────────
+    # When Stage 3 detects hard constraint violations in the LLM-produced
+    # schedule, it serialises a human-readable violation report here.
+    # Stage 2 reads this field on the next attempt and includes it in its prompt
+    # so the LLM can correct the specific mistakes.
+    constraint_feedback: Optional[str] = None
+
+    # Number of times Stage 2 has been invoked (including the first attempt).
+    # Used to cap the correction loop and avoid infinite retries.
+    drafting_attempts: int = 0
     
 class RefinementStrategy(BaseModel):
     reasoning: str = Field(description="Brief explanation of the strategy")

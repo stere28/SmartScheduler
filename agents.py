@@ -12,14 +12,14 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from llm_provider import get_llm
-from config import SHIFT_NAMES, DATES
+from config import SHIFT_NAMES, DATES, MAX_DRAFTING_ATTEMPTS
 from models import (
     ShiftPreference, WorkforcePreferences,
     Schedule, Assignment,
     ConstraintViolation, VerificationReport,
     SmartSchedulerState,
 )
-from solver import solve_schedule
+from solver import solve_schedule, verify_hard_constraints
 
 
 # ── LLM factory ───────────────────────────────────────────────────────────────
@@ -316,7 +316,7 @@ def _demo_preferences_B() -> list[dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 DRAFTING_SYSTEM_PROMPT = """\
-You are a hospital scheduling expert with deep knowledge of OR-Tools CP-SAT.
+You are a hospital scheduling expert.
 Your task is to decide on the scheduling strategy and then delegate the actual
 constraint solving to the OR-Tools solver.
 
@@ -331,32 +331,76 @@ Do NOT generate OR-Tools code yourself. The system will call the solver directly
 Only output valid JSON, no extra text.
 """
 
+DRAFTING_CORRECTION_SYSTEM_PROMPT = """\
+You are a hospital scheduling expert.
+A previous schedule attempt violated some HARD constraints.
+You will receive a detailed violation report.
+
+Your task is to acknowledge the violations and confirm you understand what
+must be fixed, then the system will re-run the solver with your acknowledgement.
+
+Output a JSON object with:
+{
+  "strategy_notes": "<explain what was wrong and how you would fix it>",
+  "use_case": "A" or "B",
+  "ready_to_solve": true
+}
+
+Only output valid JSON, no extra text.
+"""
+
 
 def drafting_agent(state: SmartSchedulerState) -> SmartSchedulerState:
     """
     Stage 2: Generate the initial schedule using the CP-SAT solver.
     The LLM provides strategic reasoning; the solver produces the actual schedule.
+
+    On correction attempts (drafting_attempts > 0), the state contains
+    `constraint_feedback` with the violations from Stage 3.  This feedback is
+    forwarded to the LLM so it can reason about what went wrong, even though
+    the actual fixing is done deterministically by the solver.
     """
-    print("\n[Stage 2] Drafting Agent running…")
+    attempt = state.drafting_attempts + 1
+    print(f"\n[Stage 2] Drafting Agent running… (attempt {attempt}/{MAX_DRAFTING_ATTEMPTS})")
 
     preferences = state.preferences
     workers     = preferences.workers
+    summary     = _summarise_preferences(workers)
 
-    # LLM strategy consultation
-    summary = _summarise_preferences(workers)
-    messages = [
-        SystemMessage(content=DRAFTING_SYSTEM_PROMPT),
-        HumanMessage(content=json.dumps({
+    # Choose prompt: first attempt vs. correction attempt
+    if state.constraint_feedback:
+        # ── Correction attempt: tell the LLM what went wrong ──────────────────
+        print("    ↩  Correction attempt – constraint feedback received from Stage 3.")
+        system_prompt = DRAFTING_CORRECTION_SYSTEM_PROMPT
+        human_payload = {
             "use_case": state.use_case,
             "preferences_summary": summary,
             "num_workers": len(workers),
-        })),
+            "constraint_violations": state.constraint_feedback,
+            "instruction": (
+                "The previous schedule violated the hard constraints listed above. "
+                "Acknowledge the violations in your strategy_notes and confirm "
+                "that the solver should be re-run with corrected parameters."
+            ),
+        }
+    else:
+        # ── First attempt ──────────────────────────────────────────────────────
+        system_prompt = DRAFTING_SYSTEM_PROMPT
+        human_payload = {
+            "use_case": state.use_case,
+            "preferences_summary": summary,
+            "num_workers": len(workers),
+        }
+
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=json.dumps(human_payload)),
     ]
     raw = _invoke_llm_with_retry(messages)
     strategy = json.loads(raw)
     print(f"    Strategy: {strategy.get('strategy_notes', 'N/A')}")
 
-    # Call the CP-SAT solver
+    # Call the CP-SAT solver (always the source of truth for the schedule)
     schedule, sat_scores = solve_schedule(
         workers=workers,
         use_case=state.use_case,
@@ -366,14 +410,18 @@ def drafting_agent(state: SmartSchedulerState) -> SmartSchedulerState:
     if schedule is None:
         print("    ✗ Solver returned INFEASIBLE.")
         return state.model_copy(update={
-            "history": state.history + ["[S2] Solver INFEASIBLE – no schedule generated."],
+            "drafting_attempts": attempt,
+            "history": state.history + [f"[S2] attempt={attempt} Solver INFEASIBLE."],
         })
 
     print(f"    ✓ Schedule generated ({len(schedule.assignments)} assignments).")
     return state.model_copy(update={
         "schedule": schedule,
+        "constraint_feedback": None,   # clear previous feedback
+        "drafting_attempts": attempt,
         "history": state.history + [
-            f"[S2] Schedule drafted. Min sat: {min(sat_scores.values()):.1f}",
+            f"[S2] attempt={attempt} Schedule drafted. "
+            f"Min sat: {min(sat_scores.values()):.1f}",
         ],
     })
 
@@ -397,165 +445,191 @@ def _summarise_preferences(workers: list[ShiftPreference]) -> dict:
 # STAGE 3 – Verification Agent
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Human-readable descriptions of every hard constraint rule.
+# Used to build the feedback message sent back to Stage 2.
+_CONSTRAINT_DESCRIPTIONS: dict[str, str] = {
+    "H1_staffing": (
+        "H1 – Minimum staffing per shift: "
+        "Use-case A requires ≥ 2 workers per shift; "
+        "Use-case B requires ≥ 1 specialized + ≥ 1 standard + ≥ 3 total."
+    ),
+    "H2_one_shift_per_day": (
+        "H2 – At most 1 shift per worker per day: "
+        "a worker cannot be assigned to two different shifts on the same calendar day."
+    ),
+    "H3_no_consecutive": (
+        "H3 – No afternoon → morning back-to-back: "
+        "if a worker does the afternoon shift on day D, "
+        "they cannot do the morning shift on day D+1."
+    ),
+    "H4_rest_after_night": (
+        f"H4 – Mandatory rest after night shift: "
+        f"after a night shift (shift index 2), the worker must have "
+        f"{__import__('config').FREE_DAYS_AFTER_NIGHT} consecutive free days "
+        f"(no assignment of any shift type)."
+    ),
+    "H5_workload": (
+        f"H5 – Monthly workload target: "
+        f"each worker must accumulate exactly "
+        f"{__import__('config').TARGET_SHIFTS_MONTH} workload units "
+        f"(morning/afternoon = 1 unit each, night = 2 units)."
+    ),
+    "H6_weekly_hours": (
+        f"H6 – Weekly hours cap: "
+        f"no worker may work more than "
+        f"{__import__('config').MAX_HOURS_PER_WEEK} hours in any single calendar week "
+        f"(morning = 6 h, afternoon = 6 h, night = 12 h)."
+    ),
+    "H7_weekly_rest": (
+        "H7 – At least 1 rest day per week: "
+        "every worker must have at least one day off in each calendar week."
+    ),
+    "H8_unavailability": (
+        "H8 – Worker unavailability: "
+        "workers with declared unavailable_days_of_week must never be assigned "
+        "on those days of the week."
+    ),
+}
+
+
+def _build_constraint_feedback(violations_by_rule: dict[str, list[str]]) -> str:
+    """
+    Build a human-readable violation report that Stage 2's LLM can understand
+    and act upon.  The report lists every violated constraint with its
+    definition and all specific instances.
+    """
+    lines = [
+        "=" * 70,
+        "HARD CONSTRAINT VIOLATION REPORT",
+        "The schedule produced in Stage 2 violates the following rules.",
+        "Each rule MUST be satisfied in the corrected schedule.",
+        "=" * 70,
+    ]
+    for rule_key, instances in violations_by_rule.items():
+        rule_desc = _CONSTRAINT_DESCRIPTIONS.get(rule_key, rule_key)
+        lines.append(f"\n[{rule_key}] {rule_desc}")
+        lines.append(f"  Violations ({len(instances)} instance(s)):")
+        # cap to 20 instances to keep the prompt manageable
+        for inst in instances[:20]:
+            lines.append(inst)
+        if len(instances) > 20:
+            lines.append(f"  … and {len(instances) - 20} more.")
+    lines.append("\n" + "=" * 70)
+    return "\n".join(lines)
+
+
 def verification_agent(state: SmartSchedulerState) -> SmartSchedulerState:
     """
-    Stage 3: Symbolically verify the schedule against hard constraints and
-    compute per-worker fairness / satisfaction scores.
+    Stage 3: Verify the schedule produced by Stage 2 against all hard
+    constraints (via solver.verify_hard_constraints), compute per-worker
+    fairness scores, and prepare feedback for Stage 2 if needed.
+
+    Behaviour
+    ---------
+    • PASS  → computes fairness, stores VerificationReport, clears
+              constraint_feedback.  The pipeline proceeds to Stage 4.
+    • FAIL  → builds a structured violation report, stores it in
+              constraint_feedback, and returns a failed VerificationReport.
+              The pipeline routes back to Stage 2 (up to MAX_DRAFTING_ATTEMPTS).
     """
     print("\n[Stage 3] Verification Agent running…")
 
+    # ── Guard: no schedule present ────────────────────────────────────────────
     if state.schedule is None:
         print("    ✗ No schedule to verify.")
+        feedback = (
+            "No schedule was produced by Stage 2. "
+            "Please generate a complete assignment for all workers and all days."
+        )
         return state.model_copy(update={
+            "constraint_feedback": feedback,
             "verification": VerificationReport(
                 passed=False,
                 violations=[ConstraintViolation(description="No schedule available.")],
                 fairness_scores={},
-            )
+            ),
+            "history": state.history + ["[S3] No schedule – feedback sent to S2."],
         })
 
     workers  = state.preferences.workers
     schedule = state.schedule
     use_case = state.use_case
 
-    violations: list[ConstraintViolation] = []
+    # ── Step 1: verify hard constraints via solver.py ─────────────────────────
+    print("    Checking hard constraints via solver.verify_hard_constraints…")
+    violations_by_rule = verify_hard_constraints(schedule, workers, use_case)
 
-    # Build lookup structures
-    # assignment_map[worker_id][day_index] = shift_index (or None)
-    from collections import defaultdict
-    assign_map: dict[str, dict[int, int]] = defaultdict(dict)
-    for a in schedule.assignments:
-        assign_map[a.worker_id][a.day_index] = a.shift_index
+    total_violations = sum(len(v) for v in violations_by_rule.values())
+    passed = total_violations == 0
 
-    # Shift staffing map: {(day, shift) → list[worker_id]}
-    shift_staff: dict[tuple, list] = defaultdict(list)
-    for a in schedule.assignments:
-        shift_staff[(a.day_index, a.shift_index)].append(a.worker_id)
+    # Convert to flat ConstraintViolation list for the VerificationReport
+    flat_violations: list[ConstraintViolation] = [
+        ConstraintViolation(description=desc)
+        for descs in violations_by_rule.values()
+        for desc in descs
+    ]
 
-    # -- Check H1: minimum staffing --
-    for d in range(len(DATES)):
-        for s in range(3):
-            staff = shift_staff[(d, s)]
-            if use_case == "A":
-                if len(staff) < 2:
-                    violations.append(ConstraintViolation(
-                        description=f"Day {d} shift {SHIFT_NAMES[s]}: only {len(staff)} workers (need ≥2)."
-                    ))
-            else:
-                n_spec = sum(1 for wid in staff if _worker_type(wid, workers) == "specialized")
-                if n_spec < 1:
-                    violations.append(ConstraintViolation(
-                        description=f"Day {d} shift {SHIFT_NAMES[s]}: no specialized worker."
-                    ))
-                if len(staff) < 3:
-                    violations.append(ConstraintViolation(
-                        description=f"Day {d} shift {SHIFT_NAMES[s]}: only {len(staff)} total workers (need ≥3)."
-                    ))
-
-    # -- Check H2: at most 1 shift per day --
-    for wp in workers:
-        for d in range(len(DATES)):
-            shifts_today = [a for a in schedule.assignments
-                            if a.worker_id == wp.worker_id and a.day_index == d]
-            if len(shifts_today) > 1:
-                violations.append(ConstraintViolation(
-                    description=f"Worker {wp.worker_id} assigned {len(shifts_today)} shifts on day {d}."
-                ))
-
-    # -- Check H3: no subsequent shifts (afternoon -> morning) --
-    for wp in workers:
-        for d in range(len(DATES) - 1):
-            if assign_map[wp.worker_id].get(d) == 1 and assign_map[wp.worker_id].get(d+1) == 0:
-                violations.append(ConstraintViolation(
-                    description=f"Worker {wp.worker_id}: afternoon on day {d} followed by morning on day {d+1}."
-                ))
-
-    # -- Check H4: 2 free days after night shift --
-    from config import FREE_DAYS_AFTER_NIGHT
-    for wp in workers:
-        for d in range(len(DATES)):
-            if assign_map[wp.worker_id].get(d) == 2:   # night shift
-                for offset in range(1, FREE_DAYS_AFTER_NIGHT + 1):
-                    if d + offset < len(DATES):
-                        if d + offset in assign_map[wp.worker_id]:
-                            violations.append(ConstraintViolation(
-                                description=(
-                                    f"Worker {wp.worker_id}: night on day {d}, "
-                                    f"but works day {d+offset} (mandatory rest violated)."
-                                )
-                            ))
-
-    # -- Check H5: total workload == 25 --
-    from config import SHIFT_WEIGHT, TARGET_SHIFTS_MONTH
-    for wp in workers:
-        total = sum(
-            SHIFT_WEIGHT[a.shift_index]
-            for a in schedule.assignments if a.worker_id == wp.worker_id
+    # ── Step 2: handle FAIL → build feedback for Stage 2 ─────────────────────
+    if not passed:
+        n_rules = len(violations_by_rule)
+        print(
+            f"    ✗ {total_violations} hard constraint violation(s) across "
+            f"{n_rules} rule(s):"
         )
-        if total != TARGET_SHIFTS_MONTH:
-            violations.append(ConstraintViolation(
-                description=(
-                    f"Worker {wp.worker_id}: workload={total}, expected={TARGET_SHIFTS_MONTH}."
-                )
-            ))
+        for rule_key, descs in violations_by_rule.items():
+            print(f"      [{rule_key}] {len(descs)} violation(s)")
+            for d in descs[:3]:
+                print(f"        {d}")
+            if len(descs) > 3:
+                print(f"        … and {len(descs) - 3} more.")
 
-    # -- Check H6: weekly hours ≤ 36 (Calendar Weeks) --
-    import math
-    from config import SHIFT_HOURS, MAX_HOURS_PER_WEEK
-    num_weeks = math.ceil(len(DATES) / 7)
-    for wp in workers:
-        for wk in range(num_weeks):
-            day_start = wk * 7
-            day_end   = min(day_start + 7, len(DATES))
-            hours = sum(
-                SHIFT_HOURS[assign_map[wp.worker_id].get(d)]
-                for d in range(day_start, day_end)
-                if d in assign_map[wp.worker_id]
-            )
-            if hours > MAX_HOURS_PER_WEEK:
-                violations.append(ConstraintViolation(
-                    description=f"Worker {wp.worker_id} week {wk}: {hours}h > {MAX_HOURS_PER_WEEK}h."
-                ))
+        feedback = _build_constraint_feedback(violations_by_rule)
 
-    # -- Check H7: at least 1 rest day per week (Calendar Weeks) --
-    for wp in workers:
-        for wk in range(num_weeks):
-            day_start = wk * 7
-            day_end   = min(day_start + 7, len(DATES))
-            worked_days = sum(1 for d in range(day_start, day_end) if d in assign_map[wp.worker_id])
-            if worked_days == (day_end - day_start):
-                violations.append(ConstraintViolation(
-                    description=f"Worker {wp.worker_id}: 0 rest days in week {wk}."
-                ))
+        return state.model_copy(update={
+            "constraint_feedback": feedback,
+            "verification": VerificationReport(
+                passed=False,
+                violations=flat_violations,
+                fairness_scores={},
+                min_satisfaction=0.0,
+                most_disadvantaged_worker=None,
+            ),
+            "history": state.history + [
+                f"[S3] FAILED – {total_violations} violation(s) in "
+                f"{n_rules} rule(s). Feedback prepared for S2."
+            ],
+        })
 
-    passed = len(violations) == 0
-
-    # -- Compute fairness scores --
+    # ── Step 3: PASS → compute fairness and forward to Stage 4 ───────────────
+    print("    ✓ All hard constraints satisfied.")
     fairness_scores = _compute_fairness(workers, schedule)
-    min_sat  = min(fairness_scores.values()) if fairness_scores else 0.0
-    worst_wid = min(fairness_scores, key=fairness_scores.get) if fairness_scores else None
+    min_sat   = min(fairness_scores.values()) if fairness_scores else 0.0
+    max_sat   = max(fairness_scores.values()) if fairness_scores else 0.0
+    worst_wid = (
+        min(fairness_scores, key=fairness_scores.get) if fairness_scores else None
+    )
+
+    print(
+        f"    Fairness – min: {min_sat:.1f}  max: {max_sat:.1f}  "
+        f"delta: {max_sat - min_sat:.1f}  "
+        f"most disadvantaged: {worst_wid}"
+    )
 
     report = VerificationReport(
-        passed=passed,
-        violations=violations,
+        passed=True,
+        violations=[],
         fairness_scores=fairness_scores,
         min_satisfaction=min_sat,
         most_disadvantaged_worker=worst_wid,
     )
 
-    if passed:
-        print(f"    ✓ All hard constraints satisfied. Min satisfaction: {min_sat:.1f}")
-    else:
-        print(f"    ✗ {len(violations)} hard constraint violation(s) found.")
-        for v in violations[:5]:
-            print(f"      • {v.description}")
-
     return state.model_copy(update={
         "verification": report,
+        "constraint_feedback": None,   # clear – no longer needed
         "history": state.history + [
-            f"[S3] Verification {'PASSED' if passed else 'FAILED'}. "
-            f"Violations: {len(violations)}. Min sat: {min_sat:.1f}. "
-            f"Worst: {worst_wid}."
+            f"[S3] PASSED. Min sat: {min_sat:.1f}. "
+            f"Max sat: {max_sat:.1f}. "
+            f"Worst worker: {worst_wid}."
         ],
     })
 
