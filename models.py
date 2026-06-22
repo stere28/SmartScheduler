@@ -101,7 +101,10 @@ class SmartSchedulerState(BaseModel):
     use_case: str = "A"                      # "A" or "B"
     preferences: Optional[WorkforcePreferences] = None
     schedule:    Optional[Schedule]            = None
-    verification: Optional[VerificationReport] = None
-    iteration:   int = 0
+    verification_passed: Optional[bool] = None
+    iteration_draft: int = 0
+    feedback_verification: Optional[str] = None
+    iteration_verification:   int = 0
+    feedback_refinement: Optional[str] = None
     converged:   bool = False
     history:     list[str] = Field(default_factory=list)  # log of actions
