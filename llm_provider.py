@@ -22,27 +22,18 @@ from langchain_core.language_models.chat_models import BaseChatModel
 # ── Supported providers ────────────────────────────────────────────────────────
 _PROVIDER_OLLAMA = "ollama"
 _PROVIDER_OPENAI = "openai"
+_PROVIDER_GROQ   = "groq"
 
 _DEFAULT_MODELS: dict[str, str] = {
     _PROVIDER_OLLAMA: "llama3.2",
     _PROVIDER_OPENAI: "gpt-4o",
+    _PROVIDER_GROQ:   "llama-3.1-70b-versatile",  
 }
 
 
 def get_llm() -> BaseChatModel:
     """
     Return a configured LangChain chat model based on environment variables.
-
-    Returns
-    -------
-    BaseChatModel
-        A ready-to-use LangChain chat model instance.
-
-    Raises
-    ------
-    ValueError
-        If the requested provider is not supported or required configuration
-        is missing.
     """
     provider    = os.environ.get("LLM_PROVIDER", _PROVIDER_OLLAMA).lower().strip()
     temperature = float(os.environ.get("LLM_TEMPERATURE", "0.2"))
@@ -51,6 +42,8 @@ def get_llm() -> BaseChatModel:
         return _build_ollama(temperature)
     elif provider == _PROVIDER_OPENAI:
         return _build_openai(temperature)
+    elif provider == _PROVIDER_GROQ:           # <-- Aggiungi questo blocco
+        return _build_groq(temperature)
     else:
         raise ValueError(
             f"Unsupported LLM_PROVIDER='{provider}'. "
@@ -106,4 +99,30 @@ def _build_openai(temperature: float) -> BaseChatModel:
         model=model,
         temperature=temperature,
         api_key=api_key,
+    )
+
+def _build_groq(temperature: float) -> BaseChatModel:
+    """Instantiate a ChatGroq model."""
+    try:
+        from langchain_groq import ChatGroq
+    except ImportError as exc:
+        raise ImportError(
+            "langchain-groq is not installed. "
+            "Run: pip install langchain-groq"
+        ) from exc
+
+    api_key = os.environ.get("GROQ_API_KEY", "")
+    if not api_key:
+        raise ValueError(
+            "LLM_PROVIDER=groq requires GROQ_API_KEY to be set."
+        )
+
+    model = os.environ.get("LLM_MODEL", _DEFAULT_MODELS[_PROVIDER_GROQ])
+
+    print(f"  [LLM] Provider: Groq | Model: {model}")
+    return ChatGroq(
+        model=model,
+        temperature=temperature,
+        api_key=api_key,
+        model_kwargs={"response_format": {"type": "json_object"}}  # <-- AGGIUNGI QUESTA RIGA
     )

@@ -95,7 +95,7 @@ def build_pipeline() -> StateGraph:
     # Entry point
     g.set_entry_point("preferences")
 
-    g.add_edges("preferences", "drafting_llm")
+    g.add_edge("preferences", "drafting_llm")
     g.add_edge("drafting_llm",    "verification")
     g.add_edge("drafting_solver", END)
     # Verification → refinement | back to drafting | end
