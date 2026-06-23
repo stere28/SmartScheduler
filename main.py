@@ -57,7 +57,6 @@ def main() -> None:
 
     print(f"\n{'='*70}")
     print("  Pipeline complete.")
-    print(f"  Refinement iterations: {final_state.iteration}")
     print(f"{'='*70}")
 
     print_worker_stats(final_state)

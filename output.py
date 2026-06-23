@@ -30,7 +30,6 @@ def print_schedule(state: SmartSchedulerState) -> None:
 
     workers   = state.preferences.workers
     schedule  = state.schedule
-    verify    = state.verification
 
     print(f"\n{'='*70}")
     print(f"  SmartScheduler – Use Case {state.use_case}")
@@ -71,39 +70,6 @@ def print_schedule(state: SmartSchedulerState) -> None:
 
     print(tabulate(staff_rows, headers=["Date", "Shift", "# Workers", "Workers"],
                    tablefmt="simple"))
-
-    # Fairness scores
-    if verify and verify.fairness_scores:
-        _print_fairness(verify)
-
-
-def _print_fairness(verify: VerificationReport) -> None:
-    print(f"\n{'─'*70}")
-    print("  Fairness / Satisfaction Scores\n")
-    scores = verify.fairness_scores
-    rows = sorted(scores.items(), key=lambda kv: kv[1])
-    table = []
-    for wid, score in rows:
-        bar = "█" * int(score / 5) + "░" * (20 - int(score / 5))
-        color = Fore.RED if score < 40 else (Fore.YELLOW if score < 60 else Fore.GREEN)
-        table.append([
-            wid,
-            f"{color}{score:.1f}{Style.RESET_ALL}",
-            f"{color}{bar}{Style.RESET_ALL}",
-        ])
-    print(tabulate(table, headers=["Worker", "Score (0-100)", "Bar"], tablefmt="simple"))
-    worst = verify.most_disadvantaged_worker
-    print(f"\n  Most disadvantaged: {Fore.RED}{worst}{Style.RESET_ALL} "
-          f"(score={scores.get(worst, 0):.1f})")
-
-    # Verification status
-    print(f"\n{'─'*70}")
-    if verify.passed:
-        print(f"  {Fore.GREEN}✓ All hard constraints satisfied.{Style.RESET_ALL}")
-    else:
-        print(f"  {Fore.RED}✗ Hard constraint violations ({len(verify.violations)}){Style.RESET_ALL}")
-        for v in verify.violations:
-            print(f"    • {v.description}")
 
 
 # ── Worker summary statistics ──────────────────────────────────────────────────
@@ -184,8 +150,6 @@ def export_json(state: SmartSchedulerState, path: str = "schedule.json") -> None
             }
             for a in sorted(state.schedule.assignments, key=lambda x: (x.worker_id, x.day_index))
         ],
-        "fairness": state.verification.fairness_scores if state.verification else {},
-        "iterations": state.iteration,
         "pipeline_log": state.history,
     }
     with p.open("w") as f:
