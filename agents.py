@@ -24,11 +24,11 @@ from solver import solve_schedule
 # ── Retry helper ──────────────────────────────────────────────────────────────
 
 def _invoke_llm_with_retry(messages: list, max_retries: int = 3, delay: float = 2.0) -> str:
+    #TODO da studiare.
+
     """
     Invoke the LLM and return the raw text content.
     Retries up to `max_retries` times if the response is empty or not valid JSON.
-    This is especially useful for smaller local models (e.g. llama3.2)
-    that occasionally produce malformed or empty outputs.
     """
     last_error: Exception | None = None
     for attempt in range(1, max_retries + 1):
@@ -63,51 +63,15 @@ def _invoke_llm_with_retry(messages: list, max_retries: int = 3, delay: float = 
     )
 
 
-# ── Worker data sanitiser ──────────────────────────────────────────────────────
-
 _VALID_SHIFTS = {"morning", "afternoon", "night"}
 _MAX_UNAVAILABLE_DAYS = 2   # cap to keep problem feasible with 10 workers
-
-
-def _sanitise_workers(workers_raw: list[dict]) -> list[dict]:
-    """
-    Post-process raw LLM output before constructing ShiftPreference objects.
-
-    Smaller models often hallucinate:
-    - Excessive unavailable_days_of_week (makes the CP-SAT model infeasible)
-    - Non-shift strings in avoided_shifts (e.g. "consecutive holidays")
-    - None instead of [] for list fields
-
-    This function applies conservative defaults so the solver always has a
-    valid, solvable input regardless of LLM output quality.
-    """
-    for w in workers_raw:
-        # Coerce None → []
-        for field in ("preferred_shifts", "avoided_shifts", "unavailable_days_of_week"):
-            if w.get(field) is None:
-                w[field] = []
-
-        # Remove invalid shift names from shift lists
-        w["preferred_shifts"] = [s for s in w["preferred_shifts"] if s in _VALID_SHIFTS]
-        w["avoided_shifts"]   = [s for s in w["avoided_shifts"]   if s in _VALID_SHIFTS]
-
-        # Cap unavailability: more than 2 days/week makes 25-shift target very hard
-        unavail = w.get("unavailable_days_of_week", [])
-        if isinstance(unavail, list) and len(unavail) > _MAX_UNAVAILABLE_DAYS:
-            print(
-                f"  [Sanitise] Worker {w.get('worker_id')}: "
-                f"unavailable_days_of_week truncated from {unavail} to {unavail[:_MAX_UNAVAILABLE_DAYS]}"
-            )
-            w["unavailable_days_of_week"] = unavail[:_MAX_UNAVAILABLE_DAYS]
-
-    return workers_raw
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STAGE 1 – Preferences Agent
 # ══════════════════════════════════════════════════════════════════════════════
 
-PREFERENCES_SYSTEM_PROMPT = """\
+#TODO correggere il prompt in modo tale da implementare le tecniche di prompt engineering 
+_PREFERENCES_SYSTEM_PROMPT = """\
 You are a scheduling assistant for a hospital. Extract STRUCTURED preferences from
 natural language worker descriptions.
 
@@ -137,23 +101,23 @@ preferred_rest_day, emergency_coverage.
 Only output valid JSON, no extra text.
 """
 
-
 def preferences_agent(state: SmartSchedulerState) -> SmartSchedulerState:
     """
     Stage 1: Parse worker preference descriptions and build WorkforcePreferences.
-    When called without real worker input (batch mode), uses the demo scenario.
     """
+
     print("\n[Stage 1] Preferences Agent running…")
 
     use_case = state.use_case
 
+    #TODO: Da file di testo, leggere le descrizioni dei lavoratori per il caso d'uso specifico.
     if use_case == "A":
         raw_descriptions = _demo_preferences_A()
     else:
         raw_descriptions = _demo_preferences_B()
 
     messages = [
-        SystemMessage(content=PREFERENCES_SYSTEM_PROMPT),
+        SystemMessage(content=_PREFERENCES_SYSTEM_PROMPT),
         HumanMessage(content=json.dumps({"worker_descriptions": raw_descriptions})),
     ]
 
@@ -248,7 +212,6 @@ def _demo_preferences_A() -> list[dict]:
         },
     ]
 
-
 def _demo_preferences_B() -> list[dict]:
     """Synthetic preference descriptions for Use Case B (10 standard + 6 specialized)."""
     standard = _demo_preferences_A()
@@ -298,53 +261,163 @@ def _demo_preferences_B() -> list[dict]:
     ]
     return standard + specialized
 
+def _sanitise_workers(workers_raw: list[dict]) -> list[dict]:
+    """
+    Post-process raw LLM output before constructing ShiftPreference objects.
+
+    Smaller models often hallucinate:
+    - Excessive unavailable_days_of_week (makes the CP-SAT model infeasible)
+    - Non-shift strings in avoided_shifts (e.g. "consecutive holidays")
+    - None instead of [] for list fields
+
+    This function applies conservative defaults so the solver always has a
+    valid, solvable input regardless of LLM output quality.
+    """
+    for w in workers_raw:
+        # Coerce None → []
+        for field in ("preferred_shifts", "avoided_shifts", "unavailable_days_of_week"):
+            if w.get(field) is None:
+                w[field] = []
+
+        # Remove invalid shift names from shift lists
+        w["preferred_shifts"] = [s for s in w["preferred_shifts"] if s in _VALID_SHIFTS]
+        w["avoided_shifts"]   = [s for s in w["avoided_shifts"]   if s in _VALID_SHIFTS]
+
+        # Cap unavailability: more than 2 days/week makes 25-shift target very hard
+        unavail = w.get("unavailable_days_of_week", [])
+        if isinstance(unavail, list) and len(unavail) > _MAX_UNAVAILABLE_DAYS:
+            print(
+                f"  [Sanitise] Worker {w.get('worker_id')}: "
+                f"unavailable_days_of_week truncated from {unavail} to {unavail[:_MAX_UNAVAILABLE_DAYS]}"
+            )
+            w["unavailable_days_of_week"] = unavail[:_MAX_UNAVAILABLE_DAYS]
+
+    return workers_raw
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STAGE 2 – Drafting Agent
+# STAGE 2a – LLM Drafting Agent
 # ══════════════════════════════════════════════════════════════════════════════
 
-DRAFTING_SYSTEM_PROMPT = """\
-You are a hospital scheduling expert with deep knowledge of OR-Tools CP-SAT.
-Your task is to decide on the scheduling strategy and then delegate the actual
-constraint solving to the OR-Tools solver.
+#TODO correggere il prompt in modo tale da implementare le tecniche di prompt engineering 
+_LLM_DRAFTING_SYSTEM_PROMPT = """\
+You are a hospital shift scheduling expert. Your task is to generate a COMPLETE
+monthly schedule for ALL workers for ALL 31 days.
 
-Given a summary of worker preferences and constraints, output a JSON object with:
+The scheduling horizon has 31 days (day_index 0 to 30).
+Shifts: 0=morning (08-14, 6h), 1=afternoon (14-20, 6h), 2=night (20-08, 12h).
+
+HARD CONSTRAINTS (must ALL be satisfied):
+- H1: Each shift (day × shift_type) must have at least 2 workers assigned.
+- H2: Each worker can work AT MOST 1 shift per day.
+- H3: After a night shift (shift_index=2), the worker cannot work the FOLLOWING morning (shift_index=0 next day).
+- H4: After a night shift, the worker must have 2 FREE days (no assignment on day+1 and day+2).
+- H5: Each worker's total workload for the month must equal exactly 25 units
+       (morning=1 unit, afternoon=1 unit, night=2 units).
+- H6: Each worker cannot exceed 36 hours per week.
+       (morning=6h, afternoon=6h, night=12h; weeks are 7-day windows starting at day 0).
+- H7: Workers have unavailable days of week (0=Mon,...,6=Sun).
+       Do NOT assign any shift to a worker on their unavailable days.
+
+IMPORTANT NOTES:
+- A night shift counts as 2 workload units.
+- With 31 days and 3 shifts × 2+ workers per shift, there are many assignments needed.
+- Balance shifts evenly across days and workers.
+
+Return ONLY a valid JSON object in this EXACT format (no extra text, no markdown):
 {
-  "strategy_notes": "<short reasoning about the approach>",
-  "use_case": "A" or "B",
-  "ready_to_solve": true
+  "assignments": [
+    {"worker_id": "W01", "day_index": 0, "shift_index": 0},
+    ...
+  ]
 }
 
-Do NOT generate OR-Tools code yourself. The system will call the solver directly.
-Only output valid JSON, no extra text.
+Generate assignments for ALL workers across ALL 31 days respecting ALL constraints.
 """
 
 
-def drafting_agent(state: SmartSchedulerState) -> SmartSchedulerState:
+def llm_drafting_agent(state: SmartSchedulerState) -> SmartSchedulerState:
     """
-    Stage 2: Generate the initial schedule using the CP-SAT solver.
-    The LLM provides strategic reasoning; the solver produces the actual schedule.
+    Stage 2a: Use the LLM to generate an initial schedule directly.
+    The LLM produces a list of (worker_id, day_index, shift_index) assignments.
     """
-    print("\n[Stage 2] Drafting Agent running…")
+    iteration_draft = state.iteration_draft
+    print(f"\n[Stage 2a] LLM Drafting Agent – draft iteration {iteration_draft + 1}…")
 
-    preferences = state.preferences
-    workers     = preferences.workers
-
-    # LLM strategy consultation
+    workers = state.preferences.workers
     summary = _summarise_preferences(workers)
+
+    # Build feedback context from previous failed verification
+    feedback_verification = None
+    feedback_refinement = None
+    if state.feedback_verification:
+        feedback_verification = f"\nPrevious verification FAILED. Fix these violations:\n{state.feedback_verification}"
+    if state.feedback_refinement:
+        feedback_refinement = f"\nPrevious refinement feedback:\n{state.feedback_refinement}"
+
     messages = [
-        SystemMessage(content=DRAFTING_SYSTEM_PROMPT),
+        SystemMessage(content=_LLM_DRAFTING_SYSTEM_PROMPT),
         HumanMessage(content=json.dumps({
             "use_case": state.use_case,
-            "preferences_summary": summary,
             "num_workers": len(workers),
+            "workers": summary,
+            "feedback": feedback_verification or feedback_refinement or "No previous feedback – first attempt.",
         })),
     ]
-    raw = _invoke_llm_with_retry(messages)
-    strategy = json.loads(raw)
-    print(f"    Strategy: {strategy.get('strategy_notes', 'N/A')}")
 
-    # Call the CP-SAT solver
+    try:
+        raw_json = _invoke_llm_with_retry(messages, max_retries=3)
+        data = json.loads(raw_json)
+        assignments_raw = data.get("assignments", [])
+
+        assignments = [
+            Assignment(
+                worker_id=str(a["worker_id"]),
+                day_index=int(a["day_index"]),
+                shift_index=int(a["shift_index"]),
+            )
+            for a in assignments_raw
+            if isinstance(a, dict)
+               and "worker_id" in a and "day_index" in a and "shift_index" in a
+               and 0 <= int(a["day_index"]) <= 30
+               and 0 <= int(a["shift_index"]) <= 2
+        ]
+
+        if not assignments:
+            raise ValueError("LLM returned an empty or invalid assignments list.")
+
+        schedule = Schedule(assignments=assignments)
+        print(f"    ✓ LLM generated schedule with {len(assignments)} assignments.")
+        return state.model_copy(update={
+            "schedule": schedule,
+            "iteration_draft": iteration_draft + 1,
+            "history": state.history + [
+                f"[S2a] LLM draft #{iteration_draft + 1}: {len(assignments)} assignments."
+            ],
+        })
+
+    except Exception as exc:
+        print(f"    ✗ LLM drafting failed: {exc}")
+        return state.model_copy(update={
+            "schedule": None,
+            "iteration_draft": iteration_draft + 1,
+            "history": state.history + [
+                f"[S2a] LLM draft #{iteration_draft + 1} FAILED: {exc}."
+            ],
+        })
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 2b – OR-Tools Solver Drafting Agent
+# ══════════════════════════════════════════════════════════════════════════════
+
+def solver_drafting_agent(state: SmartSchedulerState) -> SmartSchedulerState:
+    """
+    Stage 2b: Use the OR-Tools CP-SAT solver to generate a provably feasible schedule.
+    """
+    print(f"\n[Stage 2b] OR-Tools Solver Drafting Agent")
+
+    workers = state.preferences.workers
+
     schedule, sat_scores = solve_schedule(
         workers=workers,
         use_case=state.use_case,
@@ -352,16 +425,22 @@ def drafting_agent(state: SmartSchedulerState) -> SmartSchedulerState:
     )
 
     if schedule is None:
-        print("    ✗ Solver returned INFEASIBLE.")
+        print("   ✗ OR-Tools Solver returned INFEASIBLE.")
         return state.model_copy(update={
-            "history": state.history + ["[S2] Solver INFEASIBLE – no schedule generated."],
+            "schedule": None,
+            "history": state.history + [
+                f"[S2b] Solver draft INFEASIBLE – no schedule generated."
+            ],
         })
 
-    print(f"    ✓ Schedule generated ({len(schedule.assignments)} assignments).")
+    min_sat = min(sat_scores.values()) if sat_scores else 0.0
+    print(f"    ✓ Solver generated schedule ({len(schedule.assignments)} assignments). "
+          f"Min sat: {min_sat:.1f}")
     return state.model_copy(update={
         "schedule": schedule,
         "history": state.history + [
-            f"[S2] Schedule drafted. Min sat: {min(sat_scores.values()):.1f}",
+            f"[S2b] Solver draft: {len(schedule.assignments)} assignments. "
+            f"Min sat: {min_sat:.1f}."
         ],
     })
 
