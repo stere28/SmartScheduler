@@ -12,7 +12,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from llm_provider import get_llm
-from config import SHIFT_NAMES, DATES, MAX_DRAFTING_ATTEMPTS
+from config import SHIFT_NAMES, DATES
 from models import (
     ShiftPreference, WorkforcePreferences,
     Schedule, Assignment,
@@ -24,8 +24,6 @@ from solver import solve_schedule, verify_hard_constraints
 # ── Retry helper ──────────────────────────────────────────────────────────────
 
 def _invoke_llm_with_retry(messages: list, max_retries: int = 3, delay: float = 2.0) -> str:
-    #TODO da studiare.
-
     """
     Invoke the LLM and return the raw text content.
     Retries up to `max_retries` times if the response is empty or not valid JSON.
@@ -37,7 +35,6 @@ def _invoke_llm_with_retry(messages: list, max_retries: int = 3, delay: float = 
             response = llm.invoke(messages)
             raw = response.content.strip()
 
-            # Strip markdown fences if present
             if raw.startswith("```"):
                 parts = raw.split("```")
                 raw = parts[1] if len(parts) > 1 else raw
@@ -48,7 +45,6 @@ def _invoke_llm_with_retry(messages: list, max_retries: int = 3, delay: float = 
             if not raw:
                 raise ValueError("LLM returned an empty response.")
 
-            # Validate JSON
             json.loads(raw)
             return raw
 
@@ -110,11 +106,13 @@ def preferences_agent(state: SmartSchedulerState) -> SmartSchedulerState:
 
     use_case = state.use_case
 
-    #TODO: Da file di testo, leggere le descrizioni dei lavoratori per il caso d'uso specifico.
+    # Da file di testo, leggere le descrizioni dei lavoratori per il caso d'uso specifico.
     if use_case == "A":
-        raw_descriptions = _demo_preferences_A()
+        with open("Demo_A.txt", "r", encoding="utf-8") as f:
+            raw_descriptions = f.read()
     else:
-        raw_descriptions = _demo_preferences_B()
+        with open("Demo_B.txt", "r", encoding="utf-8") as f:
+            raw_descriptions = f.read()
 
     messages = [
         SystemMessage(content=_PREFERENCES_SYSTEM_PROMPT),
@@ -136,130 +134,6 @@ def preferences_agent(state: SmartSchedulerState) -> SmartSchedulerState:
     return state
 
 
-
-def _demo_preferences_A() -> list[dict]:
-    """Synthetic preference descriptions for Use Case A (10 homogeneous workers)."""
-    return [
-        {
-            "worker_id": "W01", "worker_name": "Alice Rossi", "worker_type": "standard",
-            "description": (
-                "Alice prefers morning shifts and would like to avoid night shifts whenever possible. "
-                "She is not available on Sundays. Her preferred rest day is Saturday."
-            )
-        },
-        {
-            "worker_id": "W02", "worker_name": "Bruno Conti", "worker_type": "standard",
-            "description": (
-                "Bruno can work during weekends but not on consecutive holidays. "
-                "He tolerates night shifts and is available for emergency coverage twice a month."
-            )
-        },
-        {
-            "worker_id": "W03", "worker_name": "Carla Esposito", "worker_type": "standard",
-            "description": (
-                "Carla prefers afternoon shifts. She does not mind night shifts "
-                "but would like Christmas day off if possible."
-            )
-        },
-        {
-            "worker_id": "W04", "worker_name": "Davide Ferrari", "worker_type": "standard",
-            "description": (
-                "Davide prefers morning shifts. He strongly dislikes night shifts "
-                "and is unavailable on Mondays."
-            )
-        },
-        {
-            "worker_id": "W05", "worker_name": "Elena Gallo", "worker_type": "standard",
-            "description": (
-                "Elena has no strong shift preferences. She accepts all shift types "
-                "and holiday work. Preferred rest day is Wednesday."
-            )
-        },
-        {
-            "worker_id": "W06", "worker_name": "Francesco Bianchi", "worker_type": "standard",
-            "description": (
-                "Francesco prefers afternoon and night shifts. He is available on holidays "
-                "and is willing to cover up to three emergency shifts per month."
-            )
-        },
-        {
-            "worker_id": "W07", "worker_name": "Giulia Marini", "worker_type": "standard",
-            "description": (
-                "Giulia prefers morning shifts and would like to avoid working on weekends. "
-                "She has low tolerance for night shifts."
-            )
-        },
-        {
-            "worker_id": "W08", "worker_name": "Hector Romano", "worker_type": "standard",
-            "description": (
-                "Hector accepts any shift type. He prefers to have Thursdays as rest days. "
-                "He is comfortable with night and holiday shifts."
-            )
-        },
-        {
-            "worker_id": "W09", "worker_name": "Irene Costa", "worker_type": "standard",
-            "description": (
-                "Irene prefers afternoon shifts. She would like to avoid night shifts but "
-                "can handle one or two per month if needed."
-            )
-        },
-        {
-            "worker_id": "W10", "worker_name": "Luca Vitale", "worker_type": "standard",
-            "description": (
-                "Luca has no strong preferences. He is available all days and tolerates "
-                "all shift types. He sees himself as a flexible team player."
-            )
-        },
-    ]
-
-def _demo_preferences_B() -> list[dict]:
-    """Synthetic preference descriptions for Use Case B (10 standard + 6 specialized)."""
-    standard = _demo_preferences_A()
-    specialized = [
-        {
-            "worker_id": "S01", "worker_name": "Marco Ricci", "worker_type": "specialized",
-            "description": (
-                "Marco is a specialized doctor. He prefers morning shifts and has low "
-                "tolerance for consecutive night shifts. He is unavailable on Sundays."
-            )
-        },
-        {
-            "worker_id": "S02", "worker_name": "Nadia Fontana", "worker_type": "specialized",
-            "description": (
-                "Nadia is a specialist. She prefers afternoon shifts and is comfortable "
-                "with holiday work. Preferred rest day is Friday."
-            )
-        },
-        {
-            "worker_id": "S03", "worker_name": "Omar Greco", "worker_type": "specialized",
-            "description": (
-                "Omar works as a specialist. He has no strong preferences and is "
-                "available for emergency coverage up to three times a month."
-            )
-        },
-        {
-            "worker_id": "S04", "worker_name": "Paola Serra", "worker_type": "specialized",
-            "description": (
-                "Paola is a specialized nurse. She prefers morning and avoids night shifts. "
-                "She is unavailable on Tuesdays."
-            )
-        },
-        {
-            "worker_id": "S05", "worker_name": "Quirino De Luca", "worker_type": "specialized",
-            "description": (
-                "Quirino is a specialist who prefers afternoon shifts. He tolerates night "
-                "shifts with low frequency and accepts holiday work."
-            )
-        },
-        {
-            "worker_id": "S06", "worker_name": "Rosa Amato", "worker_type": "specialized",
-            "description": (
-                "Rosa is a specialized technician. She has a strong preference for morning "
-                "shifts and does not want to work on weekends or holidays."
-            )
-        },
-    ]
-    return standard + specialized
 
 def _sanitise_workers(workers_raw: list[dict]) -> list[dict]:
     """
@@ -457,7 +331,6 @@ def solver_drafting_agent(state: SmartSchedulerState) -> SmartSchedulerState:
     return state.model_copy(update={
         "schedule": schedule,
         "constraint_feedback": None,   # clear previous feedback
-        "drafting_attempts": attempt,
         "history": state.history + [
             f"[S2b] Solver draft: {len(schedule.assignments)} assignments. "
             f"Min sat: {min_sat:.1f}."
