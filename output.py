@@ -108,6 +108,28 @@ def print_worker_stats(state: SmartSchedulerState) -> None:
     ))
 
 
+# ── Worker preferences summary ─────────────────────────────────────────────────
+
+def print_preferences_summary(state: SmartSchedulerState) -> None:
+    """Print the detailed preferences extracted for each worker."""
+    if state.preferences is None:
+        return
+        
+    workers = state.preferences.workers
+    print(f"\n{'─'*70}")
+    print(f"  Preferences Extracted for {len(workers)} workers\n")
+    print("    --- Dettaglio Preferenze Individuate ---")
+    for w in workers:
+        print(f"    - {w.worker_name} (ID: {w.worker_id}, Tipo: {w.worker_type})")
+        print(f"      Turni preferiti: {w.preferred_shifts}")
+        print(f"      Turni evitati: {w.avoided_shifts}")
+        print(f"      Tolleranza notte: {w.night_tolerance}, Tolleranza festivi: {w.holiday_tolerance}")
+        print(f"      Giorni non disponibili: {w.unavailable_days_of_week}")
+        print(f"      Giorno di riposo preferito: {w.preferred_rest_day}")
+        print(f"      Copertura emergenze: {w.emergency_coverage}")
+    print("    ----------------------------------------\n")
+
+
 # ── Export functions ───────────────────────────────────────────────────────────
 
 def export_csv(state: SmartSchedulerState, path: str = "schedule.csv") -> None:
