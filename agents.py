@@ -94,6 +94,57 @@ Each object must have ALL fields: worker_id, worker_name, worker_type, preferred
 avoided_shifts, night_tolerance, holiday_tolerance, unavailable_days_of_week,
 preferred_rest_day, emergency_coverage.
 
+[ESEMPIO: PREFERENZE VARIE]
+Testo di input: "Il Dr. Rossi (id: 123) è un chirurgo. Odia i turni di mattina ma adora le notti. Non può assolutamente lavorare nei fine settimana. Preferisce riposare il mercoledì. Non lavorerà nei giorni festivi in nessun caso, ma è disposto a fare 2 turni di emergenza."
+
+Output:
+{
+  "workers": [
+    {
+      "worker_id": "123",
+      "worker_name": "Dr. Rossi",
+      "worker_type": "specialized",
+      "preferred_shifts": ["night"],
+      "avoided_shifts": ["morning"],
+      "night_tolerance": true,
+      "holiday_tolerance": false,
+      "unavailable_days_of_week": [5, 6],
+      "preferred_rest_day": 2,
+      "emergency_coverage": 2
+    }
+  ]
+}
+
+[ESEMPIO: NESSUN VINCOLO]
+Testo di input: "L'infermiera Giulia Bianchi (id: 456) del reparto di Pediatria è sempre disponibile. Non ha nessuna preferenza sui turni e lavora nei festivi senza problemi. Non è disponibile per turni extra di reperibilità."
+
+Output:
+{
+  "workers": [
+    {
+      "worker_id": "456",
+      "worker_name": "Giulia Bianchi",
+      "worker_type": "standard",
+      "preferred_shifts": [],
+      "avoided_shifts": [],
+      "night_tolerance": true,
+      "holiday_tolerance": true,
+      "unavailable_days_of_week": [],
+      "preferred_rest_day": null,
+      "emergency_coverage": 0
+    }
+  ]
+}
+
+
+For each worker described in the text, you must strictly follow this workflow:
+1. IDENTIFICATION: Extract "worker_id", "worker_name", and "worker_type".
+2. SHIFT ANALYSIS: Look for keywords indicating preferences or aversions for shifts (morning, afternoon, night). Assign them to "preferred_shifts" or "avoided_shifts", respectively.
+3. TOLERANCE VERIFICATION: Check if the worker expresses a CATEGORICAL REFUSAL to work night shifts or holidays. If so, set the respective tolerance ("night_tolerance" or "holiday_tolerance") to false. Otherwise, keep the default as true.
+4. DAY MAPPING: Distinguish between the absolute inability to work on a certain day (hard constraint -> "unavailable_days_of_week") and a simple preference for resting (soft constraint -> "preferred_rest_day"). Convert the days into their respective integers (0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat, 6=Sun).
+5. EMERGENCY VERIFICATION: Identify how many extra emergency/on-call shifts per month the worker is willing to cover ("emergency_coverage").
+6. SYNTHESIS AND OUTPUT: Write a brief summary of your reasoning and generate the final JSON.
+
 Only output valid JSON, no extra text.
 """
 
