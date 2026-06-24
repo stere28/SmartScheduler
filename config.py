@@ -29,18 +29,18 @@ NO_CONSECUTIVE_SHIFTS = True        # cannot cover two subsequent shifts same da
 
 # ── Use Case A (homogeneous) ───────────────────────────────────────────────────
 UC_A = {
-    "num_workers": 10,
-    "worker_types": ["standard"] * 10,
+    "num_workers": 13,
+    "worker_types": ["standard"] * 13,
     "min_standard_per_shift": 2,
     "min_specialized_per_shift": 0,
 }
 
 # ── Use Case B (standard + specialized) ───────────────────────────────────────
 UC_B = {
-    "num_standard_workers":     10,
+    "num_standard_workers":     13,
     "num_specialized_workers":  6,
-    "num_workers":              16,
-    "worker_types": ["standard"] * 10 + ["specialized"] * 6,
+    "num_workers":              19,
+    "worker_types": ["standard"] * 13 + ["specialized"] * 6,
     "min_standard_per_shift":   2,   # at least 2 std (specialized can substitute)
     "min_specialized_per_shift":1,
 }
