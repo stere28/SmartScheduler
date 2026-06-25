@@ -60,7 +60,7 @@ def _route_after_verification(state: dict,) -> Literal["refinement", "drafting_l
     """
     s = SmartSchedulerState(**state)
 
-    if s.verification_passed:
+    if s.verification and s.verification.passed:
         return "refinement"
 
     if s.iteration_draft < MAX_DRAFT_ITERATIONS:
@@ -75,9 +75,9 @@ def _route_after_refinement(state: dict) -> Literal["verification", "end"]:
     s = SmartSchedulerState(**state)
     if s.converged:
         return "end"
-    if s.iteration_draft < MAX_REFINEMENT_ITERATIONS:
-        return "drafting_llm"
-    return "drafting_solver"
+    if s.iteration < MAX_REFINEMENT_ITERATIONS:
+        return "verification"
+    return "end"
 
 
 # ── Build graph ────────────────────────────────────────────────────────────────

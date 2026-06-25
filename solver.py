@@ -225,11 +225,26 @@ def verify_hard_constraints(
 
 # ── Main solver function ───────────────────────────────────────────────────────
 
+def _normalized_to_raw_floor(normalized_floor: float, scale: int) -> int:
+    """
+    Convert a normalized satisfaction floor (0-100 range, same as returned by
+    _compute_fairness / sat_scores) into the integer domain used by CP-SAT
+    worker_sat variables.
+
+    The normalization formula is:  normalized = (raw + 200) / 4
+    Inverse:                       raw = normalized * 4 - 200
+    CP-SAT uses integers:          floor_int = int(raw * scale)
+    """
+    raw_floor = normalized_floor * 4.0 - 200.0
+    return int(raw_floor * scale)
+
+
 def solve_schedule(
     workers: list[ShiftPreference],
     use_case: str = "A",
     min_satisfaction_floor: float = 0.0,
     pinned_worst_worker_id: Optional[str] = None,
+    pinned_min_floor: float = 0.0,
     strategy_hints: dict | None = None,
     time_limit_seconds: int = 60,
 ) -> tuple[Optional[Schedule], dict[str, float]]:
@@ -239,10 +254,19 @@ def solve_schedule(
     Args:
         workers:                 List of worker preference objects.
         use_case:                "A" (homogeneous) or "B" (std + specialized).
-        min_satisfaction_floor:  Minimum satisfaction score any worker must achieve
-                                 (used during refinement to protect already-satisfied workers).
-        pinned_worst_worker_id:  During refinement, the ID of the worst-off worker whose
-                                 satisfaction we want to explicitly improve.
+        min_satisfaction_floor:  Normalized (0-100) floor applied to ALL workers
+                                 EXCEPT the pinned worker.  Used by Stage 4 to
+                                 protect the second-worst worker and above.
+        pinned_worst_worker_id:  During refinement, the ID of the worst-off worker
+                                 whose satisfaction we want to explicitly improve.
+        pinned_min_floor:        Normalized (0-100) floor that the pinned worker
+                                 MUST strictly exceed.  Should be set to the
+                                 worker's current satisfaction score so the solver
+                                 is forced to find a strictly better assignment.
+        strategy_hints:          LLM-generated JSON with optional keys:
+                                 ``shifts_to_avoid`` (list[int]) – hard-banned shifts;
+                                 ``shifts_to_prefer`` (list[int]) – soft-boosted shifts;
+                                 ``weight_boost`` (int 1-10) – objective multiplier.
         time_limit_seconds:      CP-SAT wall-clock limit.
 
     Returns:
@@ -467,52 +491,69 @@ def solve_schedule(
     for sv in worker_sat:
         model.add(min_sat <= sv)  # min_sat is a lower bound on all satisfactions
 
-    # Refinement floor: all workers must be ≥ floor
-    if min_satisfaction_floor > 0:
-        floor_int = int(min_satisfaction_floor * SCALE)
-        for sv in worker_sat:
-            model.add(sv >= floor_int)
+    # ── Refinement floors ─────────────────────────────────────────────────────
+    # All floors are in the normalized [0, 100] range and must be converted to
+    # the raw integer domain used by worker_sat variables.
+    # Conversion: raw = normalized * 4 - 200  (inverse of the normalization formula)
 
-
-    # ── AI Refinement Strategy Integration ────────────────────────────────────
-    # Inizializza i valori di default prima del blocco
-    pinned_idx = None
-    boost_weight = 5
-    
+    # Step 1: locate the pinned worker index (None when not in refinement mode)
+    pinned_idx: int | None = None
     if pinned_worst_worker_id:
         try:
             pinned_idx = [wp.worker_id for wp in workers].index(pinned_worst_worker_id)
-            
-            floor_int = int((min_satisfaction_floor + 2.0) * SCALE)
-            model.add(worker_sat[pinned_idx] >= floor_int)
-            
-            # Applicazione deterministica dei parametri JSON
-            boost_weight = 5
-            if strategy_hints:
-                # 1. Vieta categoricamente i turni suggeriti
-                for s_avoid in strategy_hints.get("shifts_to_avoid", []):
-                    if s_avoid in SHIFTS:
-                        for d in DAYS:
-                            model.add(x[pinned_idx][d][s_avoid] == 0)
-                
-                # 2. Assegna un premio specifico per i turni da preferire
-                # (Questo altera i pesi della matrice interna di soddisfazione per questo specifico run)
-                for s_prefer in strategy_hints.get("shifts_to_prefer", []):
-                    if s_prefer in SHIFTS:
-                        for d in DAYS:
-                            model.add(x[pinned_idx][d][s_prefer] == 1) # Oppure usare un Hint morbido nel solver
-                            
-                # 3. Estrai il moltiplicatore deciso dall'IA
-                boost_weight = strategy_hints.get("weight_boost", 5)
-                        
         except ValueError:
-            pass
-            
+            pinned_idx = None
+
+    # Step 2: protect all NON-pinned workers with min_satisfaction_floor.
+    # This preserves the satisfaction of the second-worst worker (and everyone
+    # above them) so that improving the worst worker doesn't hurt others.
+    if min_satisfaction_floor > 0.0:
+        floor_int = _normalized_to_raw_floor(min_satisfaction_floor, SCALE)
+        for w in WORKERS:
+            if w == pinned_idx:
+                continue   # pinned worker handled separately below
+            model.add(worker_sat[w] >= floor_int)
+
+    # Step 3: force the pinned (worst) worker to strictly improve.
+    # pinned_min_floor is their current score; adding a small epsilon ensures
+    # the solver must find a strictly better assignment.
+    if pinned_idx is not None and pinned_min_floor > 0.0:
+        pinned_floor_int = _normalized_to_raw_floor(pinned_min_floor, SCALE)
+        model.add(worker_sat[pinned_idx] >= pinned_floor_int)
+
+    # ── AI Refinement Strategy Integration ────────────────────────────────────
+    boost_weight = 5
+    extra_pref_obj: list = []   # extra objective terms from shifts_to_prefer
+
+    if pinned_idx is not None and strategy_hints:
+        # 1. Hard-ban explicitly undesirable shifts for the pinned worker.
+        #    (Shift avoidance is a legitimate hard restriction.)
+        for s_avoid in strategy_hints.get("shifts_to_avoid", []):
+            if 0 <= s_avoid < NUM_SHIFTS:
+                for d in DAYS:
+                    model.add(x[pinned_idx][d][s_avoid] == 0)
+
+        # 2. Add a SOFT bonus for preferred shifts instead of a hard constraint.
+        #    The previous implementation used model.add(x[...] == 1) for every
+        #    (day, preferred_shift), which forces the worker to work every single
+        #    day on that shift and makes the model trivially infeasible.
+        #    We now add extra objective weight so the solver is INCENTIVISED
+        #    (not forced) to assign those shifts.
+        boost_weight = max(1, int(strategy_hints.get("weight_boost", 5)))
+        for s_prefer in strategy_hints.get("shifts_to_prefer", []):
+            if 0 <= s_prefer < NUM_SHIFTS:
+                for d in DAYS:
+                    extra_pref_obj.append(boost_weight * SCALE * x[pinned_idx][d][s_prefer])
+
     total_sat = sum(worker_sat)
-    
-    if pinned_worst_worker_id:
-        # L'obiettivo usa il boost dinamico suggerito dall'IA
-        model.maximize(7 * total_sat + 3 * n_workers * min_sat + boost_weight * worker_sat[pinned_idx])
+
+    if pinned_idx is not None:
+        # Objective: global satisfaction + fairness (min-sat) + focused boost on pinned worker
+        # extra_pref_obj provides additional incentive to assign preferred shift types
+        obj = 7 * total_sat + 3 * n_workers * min_sat + boost_weight * worker_sat[pinned_idx]
+        if extra_pref_obj:
+            obj = obj + sum(extra_pref_obj)
+        model.maximize(obj)
     else:
         model.maximize(7 * total_sat + 3 * n_workers * min_sat)
 

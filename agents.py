@@ -568,9 +568,15 @@ def verification_agent(state: SmartSchedulerState) -> SmartSchedulerState:
     fairness_scores = _compute_fairness(workers, schedule)
     min_sat   = min(fairness_scores.values()) if fairness_scores else 0.0
     max_sat   = max(fairness_scores.values()) if fairness_scores else 0.0
-    worst_wid = (
-        min(fairness_scores, key=fairness_scores.get) if fairness_scores else None
-    )
+    
+    sorted_workers = sorted(fairness_scores.items(), key=lambda x: x[1])
+    worst_wid = sorted_workers[0][0] if sorted_workers else None
+    
+    second_worst_worker = None
+    second_worst_satisfaction = 0.0
+    if len(sorted_workers) > 1:
+        second_worst_worker = sorted_workers[1][0]
+        second_worst_satisfaction = sorted_workers[1][1]
 
     print(
         f"    Fairness – min: {min_sat:.1f}  max: {max_sat:.1f}  "
@@ -584,6 +590,8 @@ def verification_agent(state: SmartSchedulerState) -> SmartSchedulerState:
         fairness_scores=fairness_scores,
         min_satisfaction=min_sat,
         most_disadvantaged_worker=worst_wid,
+        second_worst_worker=second_worst_worker,
+        second_worst_satisfaction=second_worst_satisfaction,
     )
 
     return state.model_copy(update={
@@ -619,28 +627,56 @@ def _compute_fairness(
     scores: dict[str, float] = {}
     for wp in workers:
         raw = 0.0
-        worker_assignments = [a for a in schedule.assignments if a.worker_id == wp.worker_id]
-        for a in worker_assignments:
-            shift_name = SHIFT_NAMES[a.shift_index]
-            is_hol     = _is_holiday(a.day_index)
-            dow        = DATES[a.day_index].weekday()
+        min_raw = 0.0
+        max_raw = 0.0
 
+        worker_assignments = [a for a in schedule.assignments if a.worker_id == wp.worker_id]
+        
+        for a in worker_assignments:
+            is_hol = _is_holiday(a.day_index)
+            dow = DATES[a.day_index].weekday()
+            
+            # Actual score for this assignment
+            shift_name = SHIFT_NAMES[a.shift_index]
             if shift_name in wp.preferred_shifts:
                 raw += WEIGHT_PREFERRED_SHIFT
             if shift_name in wp.avoided_shifts:
                 raw += WEIGHT_AVOIDED_SHIFT
-
             if a.shift_index == 2:
                 raw += WEIGHT_NIGHT_TOLERANCE if wp.night_tolerance else WEIGHT_NIGHT_NO_TOLERANCE
-
             if is_hol:
                 raw += WEIGHT_HOLIDAY_TOLERANCE if wp.holiday_tolerance else WEIGHT_HOLIDAY_NO_TOLERANCE
-
             if wp.preferred_rest_day is not None and dow == wp.preferred_rest_day:
-                raw -= 5   # penalise working on preferred rest day
+                raw -= 5
+                
+            # Compute min and max possible for this specific day across all 3 shifts
+            day_min = float('inf')
+            day_max = float('-inf')
+            for s in range(3):
+                s_name = SHIFT_NAMES[s]
+                s_score = 0.0
+                if s_name in wp.preferred_shifts:
+                    s_score += WEIGHT_PREFERRED_SHIFT
+                if s_name in wp.avoided_shifts:
+                    s_score += WEIGHT_AVOIDED_SHIFT
+                if s == 2:
+                    s_score += WEIGHT_NIGHT_TOLERANCE if wp.night_tolerance else WEIGHT_NIGHT_NO_TOLERANCE
+                if is_hol:
+                    s_score += WEIGHT_HOLIDAY_TOLERANCE if wp.holiday_tolerance else WEIGHT_HOLIDAY_NO_TOLERANCE
+                if wp.preferred_rest_day is not None and dow == wp.preferred_rest_day:
+                    s_score -= 5
+                
+                day_min = min(day_min, s_score)
+                day_max = max(day_max, s_score)
+                
+            min_raw += day_min
+            max_raw += day_max
 
         # Check if preferred rest day was actually granted at least once
         if wp.preferred_rest_day is not None:
+            # How many preferred rest days exist in the month?
+            total_rest_days_in_month = sum(1 for d in range(len(DATES)) if DATES[d].weekday() == wp.preferred_rest_day)
+            
             rest_days_free = sum(
                 1 for d in range(len(DATES))
                 if DATES[d].weekday() == wp.preferred_rest_day
@@ -651,10 +687,16 @@ def _compute_fairness(
             )
             if rest_days_free > 0:
                 raw += WEIGHT_REST_DAY_MET
+            
+            # The max possible is that at least one is free (gets the bonus)
+            if total_rest_days_in_month > 0:
+                max_raw += WEIGHT_REST_DAY_MET
 
-        # Normalise to [0, 100]
-        normalised = max(0.0, min(100.0, (raw + 200) / 4))
-        scores[wp.worker_id] = round(normalised, 2)
+        if max_raw == min_raw:
+            scores[wp.worker_id] = 50.0
+        else:
+            normalised = (raw - min_raw) / (max_raw - min_raw) * 100.0
+            scores[wp.worker_id] = round(max(0.0, min(100.0, normalised)), 2)
 
     return scores
 
@@ -678,6 +720,8 @@ def refinement_agent(state: SmartSchedulerState) -> SmartSchedulerState:
 
     worst_id  = verification.most_disadvantaged_worker
     worst_sat = verification.min_satisfaction
+    second_worst_id = verification.second_worst_worker
+    second_worst_sat = verification.second_worst_satisfaction
 
     # -- GESTIONE EQUITÀ PERFETTA --
     fairness_scores = state.verification.fairness_scores
@@ -725,14 +769,15 @@ def refinement_agent(state: SmartSchedulerState) -> SmartSchedulerState:
     print(f"    Strategy for {worst_id}: {strategy.get('reasoning', 'N/A')}")
 
     # Re-solve with a floor to protect currently satisfied workers
-    # Floor = current min_sat - small tolerance (allow slight regression in others)
-    floor = max(0.0, worst_sat - 5.0)
+    # Floor = second_worst_sat (as requested, don't worsen the second worst)
+    floor = second_worst_sat
 
     schedule, sat_scores = solve_schedule(
         workers=workers,
         use_case=state.use_case,
         min_satisfaction_floor=floor,
         pinned_worst_worker_id=worst_id,
+        pinned_min_floor=worst_sat + 0.1,
         strategy_hints=strategy,
         time_limit_seconds=120,
     )
@@ -742,7 +787,8 @@ def refinement_agent(state: SmartSchedulerState) -> SmartSchedulerState:
         return state.model_copy(update={"converged": True})
 
     new_min_sat = min(sat_scores.values()) if sat_scores else 0.0
-    improved    = new_min_sat > worst_sat
+    new_worst_sat = sat_scores.get(worst_id, 0.0)
+    improved    = new_worst_sat > worst_sat
 
     print(f"    Min sat: {worst_sat:.1f} → {new_min_sat:.1f} ({'↑ improved' if improved else '↔ no change'})")
 

@@ -92,6 +92,10 @@ class VerificationReport(BaseModel):
     fairness_scores: dict[str, float]     = Field(default_factory=dict)
     min_satisfaction: float = 0.0
     most_disadvantaged_worker: Optional[str] = None
+    # ID and score of the second-least-satisfied worker.
+    # Stage 4 uses this to protect the "others" during refinement.
+    second_worst_worker: Optional[str] = None
+    second_worst_satisfaction: float = 0.0
 
 
 # ── Agent state (LangGraph) ────────────────────────────────────────────────────
@@ -101,11 +105,22 @@ class SmartSchedulerState(BaseModel):
     use_case: str = "A"                      # "A" or "B"
     preferences: Optional[WorkforcePreferences] = None
     schedule:    Optional[Schedule]            = None
-    verification_passed: Optional[bool] = None
+
+    # ── Stage 3 output ─────────────────────────────────────────────────────────
+    # Full verification report (hard constraints + fairness scores).
+    # Replaces the bare bool `verification_passed` so Stage 4 can read all details.
+    verification: Optional[VerificationReport] = None
+
     iteration_draft: int = 0
     feedback_verification: Optional[str] = None
     iteration_verification:   int = 0
     feedback_refinement: Optional[str] = None
+
+    # ── Stage 4 refinement counter ─────────────────────────────────────────────
+    # Incremented by refinement_agent on every iteration.
+    # Distinct from iteration_draft (Stage 2 counter) to avoid confusion.
+    iteration: int = 0
+
     converged:   bool = False
     history:     list[str] = Field(default_factory=list)  # log of actions
 
