@@ -105,35 +105,12 @@ class SmartSchedulerState(BaseModel):
     use_case: str = "A"                      # "A" or "B"
     preferences: Optional[WorkforcePreferences] = None
     schedule:    Optional[Schedule]            = None
-
-    # ── Stage 3 output ─────────────────────────────────────────────────────────
-    # Full verification report (hard constraints + fairness scores).
-    # Replaces the bare bool `verification_passed` so Stage 4 can read all details.
     verification: Optional[VerificationReport] = None
-
     iteration_draft: int = 0
-    feedback_verification: Optional[str] = None
-    iteration_verification:   int = 0
-    feedback_refinement: Optional[str] = None
-
-    # ── Stage 4 refinement counter ─────────────────────────────────────────────
-    # Incremented by refinement_agent on every iteration.
-    # Distinct from iteration_draft (Stage 2 counter) to avoid confusion.
     iteration: int = 0
-
     converged:   bool = False
     history:     list[str] = Field(default_factory=list)  # log of actions
-
-    # ── Stage 2 ↔ Stage 3 feedback loop ───────────────────────────────────────
-    # When Stage 3 detects hard constraint violations in the LLM-produced
-    # schedule, it serialises a human-readable violation report here.
-    # Stage 2 reads this field on the next attempt and includes it in its prompt
-    # so the LLM can correct the specific mistakes.
     constraint_feedback: Optional[str] = None
-
-    # Number of times Stage 2 has been invoked (including the first attempt).
-    # Used to cap the correction loop and avoid infinite retries.
-    drafting_attempts: int = 0
     
 class RefinementStrategy(BaseModel):
     reasoning: str = Field(description="Brief explanation of the strategy")

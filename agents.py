@@ -66,7 +66,6 @@ _MAX_UNAVAILABLE_DAYS = 2   # cap to keep problem feasible with 10 workers
 # STAGE 1 – Preferences Agent
 # ══════════════════════════════════════════════════════════════════════════════
 
-#TODO correggere il prompt in modo tale da implementare le tecniche di prompt engineering 
 _PREFERENCES_SYSTEM_PROMPT = """\
 You are a scheduling assistant for a hospital. Extract STRUCTURED preferences from
 natural language worker descriptions.
@@ -157,7 +156,6 @@ def preferences_agent(state: SmartSchedulerState) -> SmartSchedulerState:
 
     use_case = state.use_case
 
-    # Da file di testo, leggere le descrizioni dei lavoratori per il caso d'uso specifico.
     if use_case == "A":
         with open("Demo_A.txt", "r", encoding="utf-8") as f:
             raw_descriptions = f.read()
@@ -290,12 +288,9 @@ def llm_drafting_agent(state: SmartSchedulerState) -> SmartSchedulerState:
     summary = _summarise_preferences(workers)
 
     # Build feedback context from previous failed verification
-    feedback_verification = None
-    feedback_refinement = None
-    if state.feedback_verification:
-        feedback_verification = f"\nPrevious verification FAILED. Fix these violations:\n{state.feedback_verification}"
-    if state.feedback_refinement:
-        feedback_refinement = f"\nPrevious refinement feedback:\n{state.feedback_refinement}"
+    feedback = None
+    if state.constraint_feedback:
+        feedback = f"\nPrevious verification FAILED. Fix these violations:\n{state.constraint_feedback}"
 
     messages = [
         SystemMessage(content=_LLM_DRAFTING_SYSTEM_PROMPT),
@@ -303,7 +298,7 @@ def llm_drafting_agent(state: SmartSchedulerState) -> SmartSchedulerState:
             "use_case": state.use_case,
             "num_workers": len(workers),
             "workers": summary,
-            "feedback": feedback_verification or feedback_refinement or "No previous feedback – first attempt.",
+            "feedback": feedback or "No previous feedback – first attempt.",
         })),
     ]
 
