@@ -51,7 +51,7 @@ def main() -> None:
     # Full LangGraph pipeline
     print(f"\n  Starting SmartScheduler pipeline (Use Case {args.use_case})…\n")
     from pipeline import run_pipeline
-    from output import print_schedule, print_worker_stats, print_preferences_summary, export_csv, export_json
+    from output import print_schedule, print_worker_stats, print_preferences_summary, print_feedback_info, export_csv, export_json
 
     final_state = run_pipeline(use_case=args.use_case)
 
@@ -60,6 +60,7 @@ def main() -> None:
     print(f"{'='*70}")
 
     print_preferences_summary(final_state)
+    print_feedback_info(final_state)
     print_worker_stats(final_state)
     print_schedule(final_state)
 

@@ -177,3 +177,46 @@ def export_json(state: SmartSchedulerState, path: str = "schedule.json") -> None
     with p.open("w") as f:
         json.dump(data, f, indent=2, default=str)
     print(f"  Schedule exported to {Fore.CYAN}{p.resolve()}{Style.RESET_ALL}")
+
+
+def print_feedback_info(state: SmartSchedulerState) -> None:
+    """Print the feedback and verification information generated during the pipeline."""
+    print(f"\n{'─'*70}")
+    print("  Feedback Information & Verification Reports\n")
+    
+    has_feedback = False
+    if getattr(state, "constraint_feedback", None):
+        print(f"    {Fore.YELLOW}[Constraint Feedback]{Style.RESET_ALL}\n")
+        # Indent the feedback text
+        for line in state.constraint_feedback.splitlines():
+            print(f"      {line}")
+        print("\n")
+        has_feedback = True
+
+    # Check for verification object (dynamically, just in case)
+    verification = getattr(state, "verification", None)
+    if verification:
+        print(f"    {Fore.CYAN}[Verification Report]{Style.RESET_ALL}")
+        print(f"      Passed: {verification.passed}")
+        if verification.most_disadvantaged_worker:
+            print(f"      Most Disadvantaged Worker: {verification.most_disadvantaged_worker}")
+            print(f"      Min Satisfaction: {verification.min_satisfaction:.1f}")
+        
+        if verification.violations:
+            print(f"\n      {Fore.RED}Violations ({len(verification.violations)}):{Style.RESET_ALL}")
+            for v in verification.violations[:10]:
+                print(f"        - {v.severity.upper()}: {v.description}")
+            if len(verification.violations) > 10:
+                print(f"        ... and {len(verification.violations) - 10} more.")
+        
+        if verification.fairness_scores:
+            print(f"\n      {Fore.GREEN}Fairness Scores:{Style.RESET_ALL}")
+            for wid, score in sorted(verification.fairness_scores.items(), key=lambda x: x[1]):
+                print(f"        Worker {wid}: {score:.1f}")
+        
+        print("\n")
+        has_feedback = True
+
+    if not has_feedback:
+        print("    No feedback information available.\n")
+
